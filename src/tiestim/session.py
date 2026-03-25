@@ -118,6 +118,7 @@ class TiePieSession(BaseSession):
         self._serials: list[str] = []
         self._finished_cb: Callable[[], None] | None = None
         self._params_ref: StimParams | None = None
+        self._armed: bool = False
 
     def _discover(self) -> None:
         lt = self._lt
@@ -164,6 +165,7 @@ class TiePieSession(BaseSession):
 
     def connect(self) -> list[DeviceState]:
         self.close()
+        self._armed = False
         self._discover()
         return self.status()
 
@@ -203,10 +205,12 @@ class TiePieSession(BaseSession):
                 raise ValueError(f"amplitude exceeds max {mx} V")
         self._configure_one(g0, d1, wf.sample_rate_hz, a1, params.repetitions)
         self._configure_one(g1, d2, wf.sample_rate_hz, a2, params.repetitions)
+        self._armed = True
 
     def start(self) -> None:
         if len(self._gens) != 2:
             raise RuntimeError("not connected")
+        self._armed = False
         g0, g1 = self._gens[0], self._gens[1]
         g0.start()
         g1.start()
@@ -226,6 +230,7 @@ class TiePieSession(BaseSession):
         threading.Thread(target=wait_burst, daemon=True).start()
 
     def stop(self) -> None:
+        self._armed = False
         for g in self._gens:
             try:
                 g.stop()
@@ -246,6 +251,8 @@ class TiePieSession(BaseSession):
             try:
                 if g.is_running:
                     st = "running"
+                elif self._armed and g.is_controllable:
+                    st = "armed"
                 elif g.is_controllable:
                     st = "ready"
                 else:
@@ -266,6 +273,7 @@ class TiePieSession(BaseSession):
                 pass
         self._gens = []
         self._serials = []
+        self._armed = False
 
     def on_run_finished(self, cb: Callable[[], None]) -> None:
         self._finished_cb = cb

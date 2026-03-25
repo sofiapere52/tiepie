@@ -117,22 +117,6 @@ def peak_voltages(p: StimParams) -> tuple[float, float]:
     return p.amplitude_v * r1, p.amplitude_v * r2
 
 
-def validate_against_limits(
-    n_samples: int,
-    data_length_max: int,
-    data_length_min: int,
-    amp1: float,
-    amp2: float,
-    amp_max: float,
-) -> None:
-    if n_samples < data_length_min or n_samples > data_length_max:
-        raise ValueError(
-            f"buffer length {n_samples} not in [{data_length_min}, {data_length_max}]"
-        )
-    if amp1 > amp_max or amp2 > amp_max:
-        raise ValueError(f"amplitude exceeds generator max {amp_max} V")
-
-
 def numpy_to_array_f(arr: np.ndarray) -> array:
     if arr.dtype != np.float32:
         arr = arr.astype(np.float32)
