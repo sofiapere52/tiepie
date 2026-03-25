@@ -1,5 +1,7 @@
 # Tiestim
 
+Source: [github.com/sofiapere52/tiepie](https://github.com/sofiapere52/tiepie).
+
 Local web UI + REST/WebSocket API to drive **two TiePie Handyscope HS5** arbitrary waveform outputs (e.g. Digitimer DS5). **Windows 10/11 x64** + [WinUSB driver](https://download.tiepie.com/Drivers/DriverInstall-WinUSB_v10.0.2.exe) + `pip install python-libtiepie` is the supported hardware path. macOS: use `TIESTIM_MOCK=1` only (no native `libtiepie`).
 
 ## Setup
