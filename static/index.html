@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tiestim — dual HS5 AWG</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>Tiestim</h1>
+    <p class="sub">Dual TiePie HS5 AWG · local control</p>
+  </header>
+
+  <section class="toolbar">
+    <button type="button" id="btn-connect">Connect devices</button>
+    <button type="button" id="btn-arm" class="primary">Arm</button>
+    <button type="button" id="btn-start">Start</button>
+    <button type="button" id="btn-stop" class="danger">STOP</button>
+    <span id="mock-badge" class="badge hidden">MOCK</span>
+  </section>
+
+  <section class="status">
+    <h2>Instrument status</h2>
+    <p class="hint">Each row: LED + label describing the current colour.</p>
+    <div id="devices"></div>
+    <p id="last-error" class="error"></p>
+  </section>
+
+  <section class="form-grid">
+    <h2>Parameters</h2>
+    <label>Mode
+      <select id="mode">
+        <option value="standard">Standard</option>
+        <option value="ti">TI (temporal interference)</option>
+      </select>
+    </label>
+    <label>Shape
+      <select id="shape">
+        <option value="sine">Sine</option>
+        <option value="triangle">Triangle</option>
+        <option value="square">Square</option>
+        <option value="ramp">Ramp</option>
+      </select>
+    </label>
+    <label id="lbl-freq">Frequency (Hz) <input type="number" id="frequency_hz" value="100" step="any" min="0.001" /></label>
+    <label id="lbl-carrier" class="hidden">Carrier f_c (Hz) <input type="number" id="carrier_hz" value="2000" step="any" /></label>
+    <label id="lbl-df" class="hidden">Δf (Hz) <input type="number" id="delta_f_hz" value="10" step="any" /></label>
+    <label id="lbl-ratio" class="hidden">Amplitude ratio (r1:r2) <input type="text" id="amplitude_ratio" value="2:3" /></label>
+    <label>Amplitude (V peak, see OPERATOR) <input type="number" id="amplitude_v" value="1" step="any" min="0.001" /></label>
+    <label>Pulse width (s, square) <input type="number" id="pulse_width_s" value="" step="any" placeholder="optional" /></label>
+    <label>Total time (s) <input type="number" id="total_time_s" value="0.1" step="any" min="0.0001" /></label>
+    <label>Pre-stim silence (s) <input type="number" id="pre_stim_s" value="0" step="any" min="0" /></label>
+    <label>Post-stim silence (s) <input type="number" id="post_stim_s" value="0" step="any" min="0" /></label>
+    <label>Sample rate (Hz) <input type="number" id="sample_rate_hz" value="100000" step="1" min="1" /></label>
+    <label>Repetitions (0 = continuous) <input type="number" id="repetitions" value="1" step="1" min="0" /></label>
+    <button type="button" id="btn-preview">Preview waveform</button>
+  </section>
+
+  <section class="preview">
+    <h2>Preview</h2>
+    <canvas id="canvas" width="900" height="220"></canvas>
+  </section>
+
+  <script src="/app.js"></script>
+</body>
+</html>
