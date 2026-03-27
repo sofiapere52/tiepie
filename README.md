@@ -20,7 +20,7 @@ set TIESTIM_MOCK=1          # optional: no USB
 python -m uvicorn tiestim.api.app:app --host 127.0.0.1 --port 8000
 ```
 
-Open `http://127.0.0.1:8000/`. Use **Connect** then **Arm** → **Start**; **STOP** stops output and logs `aborted`.
+Open `http://127.0.0.1:8000/`. Use **Connect** then **Load** → **Start**; **STOP** stops output and logs `aborted`.
 
 ## Env
 
