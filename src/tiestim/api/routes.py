@@ -6,13 +6,14 @@ import threading
 import time
 from typing import Any
 
+import numpy as np
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
 from tiestim.logger import append_stim_row, row_from_params
 from tiestim.models import StimParams, StimRequest
 from tiestim.session import BaseSession
-from tiestim.waveform import build_waveforms, peak_voltages
+from tiestim.waveform import build_waveforms, peak_amplitudes, waveform_to_amps
 
 router = APIRouter()
 
@@ -23,7 +24,7 @@ _poller_last_json: str | None = None
 _user_stop = threading.Event()
 
 
-def _payload(app: Any) -> dict:
+def _state_core(app: Any) -> dict:
     import os
 
     sess: BaseSession = app.state.session
@@ -43,12 +44,16 @@ def _payload(app: Any) -> dict:
     }
 
 
+def snapshot_payload(app: Any) -> dict:
+    return {"type": "snapshot", **_state_core(app)}
+
+
 async def push_snapshot(ws, app: Any) -> None:
-    await ws.send_json(_payload(app))
+    await ws.send_json(snapshot_payload(app))
 
 
 async def broadcast(app: Any) -> None:
-    data = json.dumps(_payload(app))
+    data = json.dumps(snapshot_payload(app))
     dead = []
     for ws in list(app.state.ws_clients):
         try:
@@ -58,6 +63,67 @@ async def broadcast(app: Any) -> None:
     for ws in dead:
         if ws in app.state.ws_clients:
             app.state.ws_clients.remove(ws)
+
+
+async def emit_log(app: Any, message: str) -> None:
+    payload = {"type": "log", "message": message, "ts": time.time()}
+    data = json.dumps(payload)
+    dead = []
+    for ws in list(app.state.ws_clients):
+        try:
+            await ws.send_text(data)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        if ws in app.state.ws_clients:
+            app.state.ws_clients.remove(ws)
+
+
+def schedule_log(app: Any, message: str) -> None:
+    loop = getattr(app.state, "loop", None)
+    if loop is not None and loop.is_running():
+        asyncio.run_coroutine_threadsafe(emit_log(app, message), loop)
+
+
+def _chunk_sleep(total_s: float, step: float = 0.05) -> bool:
+    """Return True if interrupted (_user_stop)."""
+    if total_s <= 0:
+        return False
+    end = time.monotonic() + total_s
+    while time.monotonic() < end:
+        if _user_stop.is_set():
+            return True
+        time.sleep(min(step, end - time.monotonic()))
+    return False
+
+
+def start_phase_log_thread(app: Any) -> None:
+    pr = _last_params
+    if pr is None:
+        return
+
+    def run() -> None:
+        if pr.repetitions == 0:
+            schedule_log(app, "Stimulation started (continuous until STOP)")
+            return
+        N = int(pr.repetitions)
+        pre, stim, post = pr.pre_stim_s, pr.stim_time_s, pr.post_stim_s
+        schedule_log(app, f"Stimulation started ({N} repetition(s))")
+        for i in range(N):
+            if _user_stop.is_set():
+                return
+            schedule_log(app, f"Repetition {i + 1}/{N} started")
+            schedule_log(app, "Pre-stim block started")
+            if _chunk_sleep(pre):
+                return
+            schedule_log(app, "Stimulation segment started")
+            if _chunk_sleep(stim):
+                return
+            schedule_log(app, "Post-stim block started")
+            if _chunk_sleep(post):
+                return
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 async def _burst_logged(app: Any) -> None:
@@ -71,7 +137,7 @@ async def _burst_logged(app: Any) -> None:
         dur = None
         if _run_started_monotonic is not None:
             dur = time.monotonic() - _run_started_monotonic
-        append_stim_row(
+        path = append_stim_row(
             row_from_params(
                 _last_params,
                 devs[0].serial if devs else "?",
@@ -81,6 +147,7 @@ async def _burst_logged(app: Any) -> None:
                 dur,
             )
         )
+        schedule_log(app, f"Stimulation ended; log saved to {path}")
     _run_started_monotonic = None
     await broadcast(app)
 
@@ -101,7 +168,7 @@ async def _poller(app: Any) -> None:
     global _poller_last_json
     while True:
         await asyncio.sleep(0.15)
-        snap = json.dumps(_payload(app))
+        snap = json.dumps(snapshot_payload(app))
         if snap != _poller_last_json:
             _poller_last_json = snap
             await broadcast(app)
@@ -116,7 +183,7 @@ def _ensure_poller(app: Any) -> None:
 @router.get("/health")
 async def health(request: Request):
     _ensure_poller(request.app)
-    return _payload(request.app)
+    return snapshot_payload(request.app)
 
 
 @router.post("/connect")
@@ -127,34 +194,106 @@ async def connect(request: Request):
     except Exception as e:
         request.app.state.last_error = str(e)
         await broadcast(request.app)
+        schedule_log(request.app, f"Connect failed: {e}")
         raise HTTPException(503, str(e)) from e
     request.app.state.last_error = None
     await broadcast(request.app)
-    return {"ok": True, "devices": [d.serial for d in devs]}
+    sns = [d.serial for d in devs if d.serial]
+    schedule_log(request.app, f"Device(s) connected: {' / '.join(sns)}")
+    try:
+        diag = request.app.state.session.diagnostics()
+        for d in diag:
+            schedule_log(request.app, f"  Gen {d.get('slot')}: {d}")
+    except Exception:
+        pass
+    return {"ok": True, "devices": sns}
+
+
+@router.get("/diag")
+async def diag(request: Request):
+    sess = request.app.state.session
+    try:
+        return {"generators": sess.diagnostics()}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 class PreviewOut(BaseModel):
     ch1: list[float]
     ch2: list[float]
-    n_samples: int
-    peak_v_ch1: float
-    peak_v_ch2: float
+    sum_v: list[float] | None = None
+    t_seconds: list[float]
+    cycle_duration_s: float
+    n_cycles_shown: int
+    t_total_plot_s: float
+    y_max: float
+    mode: str
+    show_sum: bool
+    pre_stim_s: float
+    stim_time_s: float
+    post_stim_s: float
+
+
+def _preview_sample_rate(p) -> float:
+    """Choose a preview sample rate: 200 points per cycle of the highest frequency."""
+    freqs = []
+    if p.mode == "ti":
+        if p.carrier_hz:
+            freqs.append(p.carrier_hz)
+        if p.carrier_hz and p.delta_f_hz:
+            freqs.append(abs(p.carrier_hz + p.delta_f_hz))
+    else:
+        if p.ch1 and p.ch1.enabled:
+            freqs.append(p.ch1.frequency_hz)
+        if p.ch2 and p.ch2.enabled:
+            freqs.append(p.ch2.frequency_hz)
+    max_f = max(freqs) if freqs else 100.0
+    return min(max_f * 200, p.sample_rate_hz)
 
 
 @router.post("/waveform/preview", response_model=PreviewOut)
 async def waveform_preview(body: StimRequest):
-    wf = build_waveforms(body.params)
     p = body.params
-    m = body.preview_max_points
-    step = max(1, wf.n_samples // m)
-    idx = slice(0, wf.n_samples, step)
-    a1, a2 = peak_voltages(p)
+    preview_sr = _preview_sample_rate(p)
+    preview_params = p.model_copy(update={"sample_rate_hz": preview_sr})
+    wf = build_waveforms(preview_params)
+    a1, a2 = peak_amplitudes(preview_params)
+    v1, v2 = waveform_to_amps(wf, a1, a2)
+    n_cycles = int(p.repetitions) if p.repetitions > 0 else 1
+    V1 = np.tile(v1, n_cycles)
+    V2 = np.tile(v2, n_cycles)
+    t_axis = np.arange(len(V1), dtype=np.float64) / preview_sr
+    show_sum = p.mode == "ti"
+    sum_arr = (V1 + V2).astype(np.float64) if show_sum else None
+    y_max = float(
+        max(
+            np.max(np.abs(V1)) if len(V1) else 0.0,
+            np.max(np.abs(V2)) if len(V2) else 0.0,
+            np.max(np.abs(sum_arr)) if sum_arr is not None and len(sum_arr) else 0.0,
+        )
+    )
+    if y_max <= 0:
+        y_max = 1.0
+    t_l = t_axis.tolist()
+    c1 = V1.tolist()
+    c2 = V2.tolist()
+    sum_l: list[float] | None = None
+    if sum_arr is not None:
+        sum_l = sum_arr.tolist()
     return PreviewOut(
-        ch1=wf.ch1[idx].tolist(),
-        ch2=wf.ch2[idx].tolist(),
-        n_samples=wf.n_samples,
-        peak_v_ch1=a1,
-        peak_v_ch2=a2,
+        ch1=c1,
+        ch2=c2,
+        sum_v=sum_l,
+        t_seconds=t_l,
+        cycle_duration_s=p.total_time_s,
+        n_cycles_shown=n_cycles,
+        t_total_plot_s=float(t_axis[-1]) if len(t_axis) else 0.0,
+        y_max=y_max,
+        mode=p.mode,
+        show_sum=show_sum,
+        pre_stim_s=p.pre_stim_s,
+        stim_time_s=p.stim_time_s,
+        post_stim_s=p.post_stim_s,
     )
 
 
@@ -163,6 +302,7 @@ async def arm(request: Request, params: StimParams):
     global _last_params
     _ensure_poller(request.app)
     sess: BaseSession = request.app.state.session
+    schedule_log(request.app, "Loading waveforms to device(s)…")
     try:
         wf = build_waveforms(params)
         sess.arm(params, wf)
@@ -171,8 +311,15 @@ async def arm(request: Request, params: StimParams):
     except Exception as e:
         request.app.state.last_error = str(e)
         await broadcast(request.app)
+        schedule_log(request.app, f"Load failed: {e}")
         raise HTTPException(400, str(e)) from e
     await broadcast(request.app)
+    schedule_log(request.app, "Loaded — ready for Start")
+    if params.mode == "ti":
+        schedule_log(
+            request.app,
+            "TI sync active — ensure CMI cable connects both HS5 units",
+        )
     return {"ok": True}
 
 
@@ -189,8 +336,10 @@ async def start_run(request: Request):
     except Exception as e:
         request.app.state.last_error = str(e)
         await broadcast(request.app)
+        schedule_log(request.app, f"Start failed: {e}")
         raise HTTPException(400, str(e)) from e
     await broadcast(request.app)
+    start_phase_log_thread(request.app)
     return {"ok": True}
 
 
@@ -199,6 +348,7 @@ async def stop_run(request: Request):
     global _last_params, _run_started_monotonic
     _ensure_poller(request.app)
     _user_stop.set()
+    schedule_log(request.app, "STOP requested")
     sess: BaseSession = request.app.state.session
     try:
         sess.stop()
@@ -207,7 +357,7 @@ async def stop_run(request: Request):
             dur = None
             if _run_started_monotonic is not None:
                 dur = time.monotonic() - _run_started_monotonic
-            append_stim_row(
+            path = append_stim_row(
                 row_from_params(
                     _last_params,
                     devs[0].serial if devs else "?",
@@ -217,6 +367,7 @@ async def stop_run(request: Request):
                     dur,
                 )
             )
+            schedule_log(request.app, f"Stimulation stopped; log saved to {path}")
         _run_started_monotonic = None
         request.app.state.last_error = None
     except Exception as e:

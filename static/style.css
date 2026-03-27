@@ -15,9 +15,8 @@ body {
   background: var(--bg);
   color: var(--text);
   margin: 0;
-  padding: 1.25rem 1.5rem 3rem;
-  max-width: 960px;
-  margin-inline: auto;
+  padding: 1rem 1.25rem 3rem;
+  max-width: 100%;
 }
 
 header h1 { margin: 0; font-size: 1.5rem; }
@@ -106,7 +105,7 @@ section h2 { margin-top: 0; font-size: 1.05rem; }
 
 .form-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 0.65rem 1rem;
   align-items: end;
 }
@@ -127,10 +126,83 @@ input, select {
 }
 #btn-preview { grid-column: 1 / -1; justify-self: start; }
 
-#canvas {
+.subgrid-title {
+  grid-column: 1 / -1;
+  margin: 0.5rem 0 0;
+  font-size: 0.95rem;
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.ch-toggle {
+  font-size: 0.78rem;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-direction: row;
+  cursor: pointer;
+}
+.ch-toggle input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}
+
+.panel-ti,
+.panel-control {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 0.65rem 1rem;
+  align-items: end;
+}
+
+.trigger-row {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 1.5rem;
+  align-items: center;
+  margin: 0.25rem 0;
+}
+
+.readonly-field {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+.uplot-wrap {
+  margin-bottom: 0.5rem;
   width: 100%;
-  max-width: 900px;
-  height: auto;
+  overflow: hidden;
+}
+.uplot-wrap > .uplot {
+  width: 100% !important;
+}
+
+.uplot-wrap .u-title {
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
+.uplot-wrap .u-wrap {
+  width: 100% !important;
+}
+
+.live-log pre {
+  margin: 0;
+  max-height: 200px;
+  overflow: auto;
   background: var(--bg);
-  border-radius: 4px;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 0.65rem 0.75rem;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
 }

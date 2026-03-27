@@ -21,13 +21,15 @@ class StimLogRow:
     frequency_hz: float | None
     carrier_hz: float | None
     delta_f_hz: float | None
-    amplitude_v: float
+    amplitude_a: float
     amplitude_ratio: str | None
     pulse_width_s: float | None
     sample_rate_hz: float
+    stim_time_s: float
     total_time_s: float
     pre_stim_s: float
     post_stim_s: float
+    ramp_s: float
     repetitions: int
     device_1_serial: str
     device_2_serial: str
@@ -45,13 +47,15 @@ class StimLogRow:
             "frequency_hz",
             "carrier_hz",
             "delta_f_hz",
-            "amplitude_v",
+            "amplitude_a",
             "amplitude_ratio",
             "pulse_width_s",
             "sample_rate_hz",
+            "stim_time_s",
             "total_time_s",
             "pre_stim_s",
             "post_stim_s",
+            "ramp_s",
             "repetitions",
             "device_1_serial",
             "device_2_serial",
@@ -88,21 +92,37 @@ def row_from_params(
 ) -> StimLogRow:
     now = datetime.now(timezone.utc)
     local = datetime.now().astimezone()
+    if params.mode == "ti":
+        freq = None
+        shape = params.shape
+        amp = float(params.amplitude_a) if params.amplitude_a is not None else 0.0
+        pulse = params.pulse_width_s
+    else:
+        assert params.ch1 is not None and params.ch2 is not None
+        freq = params.ch1.frequency_hz
+        shape = f"{params.ch1.shape}/{params.ch2.shape}"
+        amp = max(
+            params.ch1.amplitude_a if params.ch1.enabled else 0.0,
+            params.ch2.amplitude_a if params.ch2.enabled else 0.0,
+        )
+        pulse = params.ch1.pulse_width_s or params.ch2.pulse_width_s
     return StimLogRow(
         timestamp_utc=now.isoformat(),
         timestamp_local=local.isoformat(),
         mode=params.mode,
-        shape=params.shape,
-        frequency_hz=params.frequency_hz if params.mode == "standard" else None,
+        shape=shape,
+        frequency_hz=freq if params.mode == "control" else None,
         carrier_hz=params.carrier_hz if params.mode == "ti" else None,
         delta_f_hz=params.delta_f_hz if params.mode == "ti" else None,
-        amplitude_v=params.amplitude_v,
+        amplitude_a=amp,
         amplitude_ratio=params.amplitude_ratio,
-        pulse_width_s=params.pulse_width_s,
+        pulse_width_s=pulse,
         sample_rate_hz=params.sample_rate_hz,
+        stim_time_s=params.stim_time_s,
         total_time_s=params.total_time_s,
         pre_stim_s=params.pre_stim_s,
         post_stim_s=params.post_stim_s,
+        ramp_s=params.ramp_s,
         repetitions=params.repetitions,
         device_1_serial=serial1,
         device_2_serial=serial2,

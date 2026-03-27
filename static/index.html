@@ -3,18 +3,20 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Tiestim — dual HS5 AWG</title>
-  <link rel="stylesheet" href="/style.css" />
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <title>TiePie HS5 GUI</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css" />
+  <link rel="stylesheet" href="/style.css?v=3" />
 </head>
 <body>
   <header>
-    <h1>Tiestim</h1>
+    <h1>TiePie HS5 GUI</h1>
     <p class="sub">Dual TiePie HS5 AWG · local control</p>
   </header>
 
   <section class="toolbar">
     <button type="button" id="btn-connect">Connect devices</button>
-    <button type="button" id="btn-arm" class="primary">Arm</button>
+    <button type="button" id="btn-arm" class="primary">Load</button>
     <button type="button" id="btn-start">Start</button>
     <button type="button" id="btn-stop" class="danger">STOP</button>
     <span id="mock-badge" class="badge hidden">MOCK</span>
@@ -31,37 +33,81 @@
     <h2>Parameters</h2>
     <label>Mode
       <select id="mode">
-        <option value="standard">Standard</option>
+        <option value="control">Control (independent channels)</option>
         <option value="ti">TI (temporal interference)</option>
       </select>
     </label>
-    <label>Shape
-      <select id="shape">
+
+    <div id="panel-ti" class="panel-ti hidden">
+      <label>TI shape <select id="ti_shape">
         <option value="sine">Sine</option>
         <option value="triangle">Triangle</option>
         <option value="square">Square</option>
         <option value="ramp">Ramp</option>
-      </select>
-    </label>
-    <label id="lbl-freq">Frequency (Hz) <input type="number" id="frequency_hz" value="100" step="any" min="0.001" /></label>
-    <label id="lbl-carrier" class="hidden">Carrier f_c (Hz) <input type="number" id="carrier_hz" value="2000" step="any" /></label>
-    <label id="lbl-df" class="hidden">Δf (Hz) <input type="number" id="delta_f_hz" value="10" step="any" /></label>
-    <label id="lbl-ratio" class="hidden">Amplitude ratio (r1:r2) <input type="text" id="amplitude_ratio" value="2:3" /></label>
-    <label>Amplitude (V peak, see OPERATOR) <input type="number" id="amplitude_v" value="1" step="any" min="0.001" /></label>
-    <label>Pulse width (s, square) <input type="number" id="pulse_width_s" value="" step="any" placeholder="optional" /></label>
-    <label>Total time (s) <input type="number" id="total_time_s" value="0.1" step="any" min="0.0001" /></label>
+        <option value="tbs">TBS (theta burst)</option>
+      </select></label>
+      <label>Carrier f_c (Hz) <input type="number" id="carrier_hz" value="2000" step="any" /></label>
+      <label id="lbl-delta-f">Δf (Hz) <input type="number" id="delta_f_hz" value="10" step="any" /></label>
+      <label id="lbl-tbs-freq" class="hidden">TBS frequency (Hz) <input type="number" id="tbs_freq_hz" value="5" step="any" min="2" max="8" /></label>
+      <label>Amplitude ratio (r1:r2) <input type="text" id="amplitude_ratio" value="2:3" /></label>
+      <label>Total amplitude (A peak) <input type="number" id="ti_amplitude_a" value="0.002" step="any" min="0.0001" /></label>
+    </div>
+
+    <div id="panel-control" class="panel-control">
+      <h3 class="subgrid-title">Channel 1
+        <label class="ch-toggle"><input type="checkbox" id="ch1_enabled" checked /> Enabled</label>
+      </h3>
+      <label>Ch1 shape <select id="ch1_shape">
+        <option value="sine">Sine</option>
+        <option value="triangle">Triangle</option>
+        <option value="square">Square</option>
+        <option value="ramp">Ramp</option>
+      </select></label>
+      <label>Ch1 frequency (Hz) <input type="number" id="ch1_frequency_hz" value="100" step="any" min="0.001" /></label>
+      <label>Ch1 amplitude (A pk) <input type="number" id="ch1_amplitude_a" value="0.001" step="any" min="0.0001" /></label>
+      <label>Ch1 pulse width (s) <input type="number" id="ch1_pulse_width_s" value="" step="any" placeholder="square" /></label>
+
+      <h3 class="subgrid-title">Channel 2
+        <label class="ch-toggle"><input type="checkbox" id="ch2_enabled" checked /> Enabled</label>
+      </h3>
+      <label>Ch2 shape <select id="ch2_shape">
+        <option value="sine">Sine</option>
+        <option value="triangle">Triangle</option>
+        <option value="square">Square</option>
+        <option value="ramp">Ramp</option>
+      </select></label>
+      <label>Ch2 frequency (Hz) <input type="number" id="ch2_frequency_hz" value="100" step="any" min="0.001" /></label>
+      <label>Ch2 amplitude (A pk) <input type="number" id="ch2_amplitude_a" value="0.001" step="any" min="0.0001" /></label>
+      <label>Ch2 pulse width (s) <input type="number" id="ch2_pulse_width_s" value="" step="any" placeholder="square" /></label>
+    </div>
+
+    <label>Stimulation time (s) <input type="number" id="stim_time_s" value="0.1" step="any" min="0.0001" /></label>
     <label>Pre-stim silence (s) <input type="number" id="pre_stim_s" value="0" step="any" min="0" /></label>
     <label>Post-stim silence (s) <input type="number" id="post_stim_s" value="0" step="any" min="0" /></label>
-    <label>Sample rate (Hz) <input type="number" id="sample_rate_hz" value="100000" step="1" min="1" /></label>
+    <label>Ramp up/down (s each) <input type="number" id="ramp_s" value="0" step="any" min="0" /></label>
+    <p class="readonly-field">Total time per cycle (s): <strong id="total_time_display">0.1</strong> <span class="hint">(pre + stim + post)</span></p>
     <label>Repetitions (0 = continuous) <input type="number" id="repetitions" value="1" step="1" min="0" /></label>
+    <div class="trigger-row">
+      <label class="ch-toggle"><input type="checkbox" id="trigger_out" /> Trigger Out (EXT 1)</label>
+      <label class="ch-toggle"><input type="checkbox" id="trigger_in" /> Trigger In (EXT 2)</label>
+    </div>
     <button type="button" id="btn-preview">Preview waveform</button>
   </section>
 
   <section class="preview">
     <h2>Preview</h2>
-    <canvas id="canvas" width="900" height="220"></canvas>
+    <p class="hint">Scroll wheel zooms; drag to pan. Shows full repetition train.</p>
+    <div id="u-ch1" class="uplot-wrap"></div>
+    <div id="u-ch2" class="uplot-wrap"></div>
+    <div id="u-sum" class="uplot-wrap hidden"></div>
   </section>
 
-  <script src="/app.js"></script>
+  <section class="live-log">
+    <h2>Live log</h2>
+    <pre id="log-panel"></pre>
+  </section>
+
+  <script src="/app.js?v=3"></script>
+  <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js" defer></script>
 </body>
 </html>

@@ -3,11 +3,11 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
 
 
-Shape = Literal["sine", "triangle", "square", "ramp"]
-StimMode = Literal["standard", "ti"]
+Shape = Literal["sine", "triangle", "square", "ramp", "tbs"]
+StimMode = Literal["control", "ti"]
 
 
 def parse_amplitude_ratio(s: str) -> tuple[float, float]:
@@ -21,36 +21,94 @@ def parse_amplitude_ratio(s: str) -> tuple[float, float]:
     return a, b
 
 
-class StimParams(BaseModel):
-    mode: StimMode = "standard"
+class ChannelParams(BaseModel):
+    enabled: bool = True
     shape: Shape = "sine"
-    frequency_hz: float = Field(gt=0, description="Carrier / tone frequency (standard mode)")
-    amplitude_v: float = Field(gt=0, description="Peak voltage at BNC (per channel or total in TI)")
+    frequency_hz: float = Field(gt=0, default=100)
+    amplitude_a: float = Field(gt=0, description="Peak current in Amps for this channel", default=0.001)
     pulse_width_s: float | None = Field(
         default=None,
         ge=0,
-        description="Square: high-time within one period (s); ignored for sine/triangle/ramp",
+        description="Square: high-time within one period (s)",
     )
-    total_time_s: float = Field(gt=0)
+
+
+class StimParams(BaseModel):
+    mode: StimMode = "control"
+    shape: Shape = "sine"
+    frequency_hz: float | None = Field(
+        default=None,
+        gt=0,
+        description="TI: duplicate of carrier for API",
+    )
+    amplitude_a: float | None = Field(
+        default=None,
+        gt=0,
+        description="TI: total peak current budget (A); control: unused (use ch1/ch2)",
+    )
+    pulse_width_s: float | None = Field(
+        default=None,
+        ge=0,
+    )
+    stim_time_s: float = Field(gt=0, description="Active stimulation duration within one cycle (s)")
     pre_stim_s: float = Field(ge=0, default=0)
     post_stim_s: float = Field(ge=0, default=0)
-    sample_rate_hz: float = Field(gt=0)
+    ramp_s: float = Field(ge=0, default=0, description="Linear ramp up and down at start/end of active segment (s)")
+    sample_rate_hz: float = Field(gt=0, default=500_000, description="Hardware sample rate (Hz); fixed for HS5")
     repetitions: int = Field(
         ge=0,
         default=1,
-        description="0 = continuous until STOP; >0 = burst count (one buffer per burst)",
+        description="0 = continuous until STOP; >0 = play one buffer this many times then stop",
     )
     carrier_hz: float | None = Field(default=None, gt=0)
     delta_f_hz: float | None = Field(default=None)
     amplitude_ratio: str | None = Field(default=None, description='TI only, e.g. "2:3"')
+    ch1: ChannelParams | None = None
+    ch2: ChannelParams | None = None
+    trigger_out: bool = False
+    trigger_in: bool = False
+    tbs_freq_hz: float | None = Field(
+        default=None,
+        ge=2,
+        le=8,
+        description="TBS burst repetition rate (Hz); TI+TBS shape only",
+    )
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def coerce_standard(cls, v):
+        if v == "standard":
+            return "control"
+        return v
+
+    @computed_field
+    @property
+    def total_time_s(self) -> float:
+        return self.pre_stim_s + self.stim_time_s + self.post_stim_s
 
     @model_validator(mode="after")
-    def ti_required_fields(self):
+    def ramp_and_mode_fields(self):
+        if self.ramp_s > self.stim_time_s:
+            raise ValueError("ramp_s cannot exceed stim_time_s")
+        if self.ramp_s > 0 and 2 * self.ramp_s > self.stim_time_s:
+            raise ValueError(
+                "ramp up and ramp down would overlap: need 2 * ramp_s <= stim_time_s "
+                "(or set ramp_s to 0)"
+            )
         if self.mode == "ti":
+            if self.amplitude_a is None:
+                raise ValueError("TI mode requires amplitude_a")
             if self.carrier_hz is None or self.delta_f_hz is None or self.amplitude_ratio is None:
                 raise ValueError("TI mode requires carrier_hz, delta_f_hz, amplitude_ratio")
             if self.delta_f_hz == 0:
                 raise ValueError("delta_f_hz must be non-zero in TI mode")
+            if self.shape == "tbs" and self.tbs_freq_hz is None:
+                raise ValueError("TBS shape requires tbs_freq_hz (2–8 Hz)")
+        else:
+            if self.ch1 is None or self.ch2 is None:
+                raise ValueError("control mode requires ch1 and ch2 channel parameters")
+            if not self.ch1.enabled and not self.ch2.enabled:
+                raise ValueError("at least one channel must be enabled in control mode")
         return self
 
     def ti_parts(self) -> tuple[float, float, float, float]:
