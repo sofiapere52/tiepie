@@ -234,8 +234,11 @@ class PreviewOut(BaseModel):
     post_stim_s: float
 
 
+_PREVIEW_MAX_SAMPLES = 100_000
+
 def _preview_sample_rate(p) -> float:
-    """Choose a preview sample rate: 200 points per cycle of the highest frequency."""
+    """Choose a preview sample rate high enough for visual fidelity but
+    capped so a single buffer never exceeds ~_PREVIEW_MAX_SAMPLES."""
     freqs = []
     if p.mode == "ti":
         if p.carrier_hz:
@@ -248,7 +251,12 @@ def _preview_sample_rate(p) -> float:
         if p.ch2 and p.ch2.enabled:
             freqs.append(p.ch2.frequency_hz)
     max_f = max(freqs) if freqs else 100.0
-    return min(max_f * 200, p.sample_rate_hz)
+    ideal = max_f * 200
+    total_s = p.total_time_s
+    if total_s > 0 and ideal * total_s > _PREVIEW_MAX_SAMPLES:
+        ideal = _PREVIEW_MAX_SAMPLES / total_s
+    ideal = max(ideal, max_f * 4)
+    return min(ideal, p.sample_rate_hz)
 
 
 @router.post("/waveform/preview", response_model=PreviewOut)
@@ -260,11 +268,22 @@ async def waveform_preview(body: StimRequest):
     a1, a2 = peak_amplitudes(preview_params)
     v1, v2 = waveform_to_amps(wf, a1, a2)
     n_cycles = int(p.repetitions) if p.repetitions > 0 else 1
+    n_cycles = min(n_cycles, 3)
     V1 = np.tile(v1, n_cycles)
     V2 = np.tile(v2, n_cycles)
     t_axis = np.arange(len(V1), dtype=np.float64) / preview_sr
     show_sum = p.mode == "ti"
     sum_arr = (V1 + V2).astype(np.float64) if show_sum else None
+
+    max_pts = body.preview_max_points
+    if len(V1) > max_pts:
+        stride = max(1, len(V1) // max_pts)
+        V1 = V1[::stride]
+        V2 = V2[::stride]
+        t_axis = t_axis[::stride]
+        if sum_arr is not None:
+            sum_arr = sum_arr[::stride]
+
     y_max = float(
         max(
             np.max(np.abs(V1)) if len(V1) else 0.0,

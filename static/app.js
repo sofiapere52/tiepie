@@ -303,6 +303,10 @@ function wireButtons() {
     try {
       const body = collectParams();
       const out = await api("/waveform/preview", { method: "POST", body: JSON.stringify(body) });
+      if (!out || !out.t_seconds || !out.ch1) {
+        appendLogLine("Preview failed: server returned incomplete data");
+        return;
+      }
       drawPreviewUplot(out);
     } catch (e) { alert(e.message); }
   });
