@@ -102,7 +102,7 @@ def build_waveforms(p: StimParams) -> WaveformPair:
                 continue
             if abs(ch.frequency_hz) >= 0.5 * sr:
                 raise ValueError(f"frequency_hz violates Nyquist at sample_rate_hz={sr}")
-            _fill_active(y, a, b, t, ch.shape, ch.frequency_hz, ch.amplitude_a, ch.pulse_width_s, sr)
+            _fill_active(y, a, b, t, ch.shape, ch.frequency_hz, ch.amplitude_ma, ch.pulse_width_s, sr)
         _apply_ramp(y1, a, b, sr, p.ramp_s)
         _apply_ramp(y2, a, b, sr, p.ramp_s)
     else:
@@ -112,9 +112,9 @@ def build_waveforms(p: StimParams) -> WaveformPair:
         for name, f in [("carrier", fc), ("carrier+df", f2)]:
             if abs(f) >= nyq:
                 raise ValueError(f"{name} frequency {f} Hz violates Nyquist at sr={sr}")
-        assert p.amplitude_a is not None
-        a1 = p.amplitude_a * r1
-        a2 = p.amplitude_a * r2
+        assert p.amplitude_ma is not None
+        a1 = p.amplitude_ma * r1
+        a2 = p.amplitude_ma * r2
         ta = t[a:b] - t[a]
         y1[a:b] = a1 * np.cos(2 * np.pi * fc * ta)
         y2[a:b] = -a2 * np.cos(2 * np.pi * f2 * ta)
@@ -146,14 +146,14 @@ def build_waveforms(p: StimParams) -> WaveformPair:
 
 
 def peak_amplitudes(p: StimParams) -> tuple[float, float]:
-    """Per-channel peak amplitude (A) after normalization."""
+    """Per-channel peak amplitude (mA) after normalization; numerically equals HS5 voltage (V)."""
     if p.mode == "control":
         assert p.ch1 is not None and p.ch2 is not None
-        return (p.ch1.amplitude_a if p.ch1.enabled else 0.0,
-                p.ch2.amplitude_a if p.ch2.enabled else 0.0)
-    assert p.amplitude_a is not None
+        return (p.ch1.amplitude_ma if p.ch1.enabled else 0.0,
+                p.ch2.amplitude_ma if p.ch2.enabled else 0.0)
+    assert p.amplitude_ma is not None
     _, _, r1, r2 = p.ti_parts()
-    return p.amplitude_a * r1, p.amplitude_a * r2
+    return p.amplitude_ma * r1, p.amplitude_ma * r2
 
 
 def numpy_to_array_f(arr: np.ndarray) -> array:

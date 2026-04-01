@@ -21,7 +21,7 @@ class StimLogRow:
     frequency_hz: float | None
     carrier_hz: float | None
     delta_f_hz: float | None
-    amplitude_a: float
+    amplitude_ma: float
     amplitude_ratio: str | None
     pulse_width_s: float | None
     sample_rate_hz: float
@@ -47,7 +47,7 @@ class StimLogRow:
             "frequency_hz",
             "carrier_hz",
             "delta_f_hz",
-            "amplitude_a",
+            "amplitude_ma",
             "amplitude_ratio",
             "pulse_width_s",
             "sample_rate_hz",
@@ -95,15 +95,15 @@ def row_from_params(
     if params.mode == "ti":
         freq = None
         shape = params.shape
-        amp = float(params.amplitude_a) if params.amplitude_a is not None else 0.0
+        amp = float(params.amplitude_ma) if params.amplitude_ma is not None else 0.0
         pulse = params.pulse_width_s
     else:
         assert params.ch1 is not None and params.ch2 is not None
         freq = params.ch1.frequency_hz
         shape = f"{params.ch1.shape}/{params.ch2.shape}"
         amp = max(
-            params.ch1.amplitude_a if params.ch1.enabled else 0.0,
-            params.ch2.amplitude_a if params.ch2.enabled else 0.0,
+            params.ch1.amplitude_ma if params.ch1.enabled else 0.0,
+            params.ch2.amplitude_ma if params.ch2.enabled else 0.0,
         )
         pulse = params.ch1.pulse_width_s or params.ch2.pulse_width_s
     return StimLogRow(
@@ -114,7 +114,7 @@ def row_from_params(
         frequency_hz=freq if params.mode == "control" else None,
         carrier_hz=params.carrier_hz if params.mode == "ti" else None,
         delta_f_hz=params.delta_f_hz if params.mode == "ti" else None,
-        amplitude_a=amp,
+        amplitude_ma=amp,
         amplitude_ratio=params.amplitude_ratio,
         pulse_width_s=pulse,
         sample_rate_hz=params.sample_rate_hz,

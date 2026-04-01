@@ -44,7 +44,7 @@ function collectParams() {
     const params = {
       ...common,
       shape: tiShape,
-      amplitude_a: num("ti_amplitude_a", 0.002),
+      amplitude_ma: num("ti_amplitude_ma", 2),
       carrier_hz: carrier,
       delta_f_hz: isTbs ? 50 : num("delta_f_hz", 10),
       amplitude_ratio: (byId("amplitude_ratio") || {}).value || "1:1",
@@ -62,7 +62,7 @@ function collectParams() {
       enabled,
       shape: (byId(prefix + "_shape") || {}).value || "sine",
       frequency_hz: num(prefix + "_frequency_hz", 100),
-      amplitude_a: num(prefix + "_amplitude_a", 0.001),
+      amplitude_ma: num(prefix + "_amplitude_ma", 1),
       pulse_width_s: pulse,
     };
   };
@@ -235,10 +235,10 @@ function drawPreviewUplot(out) {
       x: { time: false },
       y: { range: [-yMax * 1.08, yMax * 1.08] },
     },
-    series: [{}, { stroke, width: 1, label: "A" }],
+    series: [{}, { stroke, width: 1, label: "mA" }],
     axes: [
       { stroke: "#8b949e", grid: { stroke: "#30363d22" }, label: "Time (s)", size: 32 },
-      { stroke: "#8b949e", grid: { stroke: "#30363d22" }, label: "Amplitude (A)", size: 52 },
+      { stroke: "#8b949e", grid: { stroke: "#30363d22" }, label: "Amplitude (mA)", size: 60 },
     ],
     legend: { show: false },
   });
@@ -252,10 +252,10 @@ function drawPreviewUplot(out) {
   us.innerHTML = "";
   us.classList.toggle("hidden", !out.show_sum);
 
-  previewCharts.push(new uPlot(opts("Channel 1 (A)", "#58a6ff"), [t, out.ch1], u1));
-  previewCharts.push(new uPlot(opts("Channel 2 (A)", "#f0883e"), [t, out.ch2], u2));
+  previewCharts.push(new uPlot(opts("Channel 1 (mA)", "#58a6ff"), [t, out.ch1], u1));
+  previewCharts.push(new uPlot(opts("Channel 2 (mA)", "#f0883e"), [t, out.ch2], u2));
   if (out.show_sum && out.sum_v) {
-    previewCharts.push(new uPlot(opts("TI sum Ch1+Ch2 (A)", "#a371f7"), [t, out.sum_v], us));
+    previewCharts.push(new uPlot(opts("TI sum Ch1+Ch2 (mA)", "#a371f7"), [t, out.sum_v], us));
   }
 }
 

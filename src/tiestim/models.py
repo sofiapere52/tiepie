@@ -25,7 +25,7 @@ class ChannelParams(BaseModel):
     enabled: bool = True
     shape: Shape = "sine"
     frequency_hz: float = Field(gt=0, default=100)
-    amplitude_a: float = Field(gt=0, description="Peak current in Amps for this channel", default=0.001)
+    amplitude_ma: float = Field(gt=0, le=10, description="Peak amplitude (mA); sets HS5 output voltage = this value in V (DS5: 1 mA/V)", default=1.0)
     pulse_width_s: float | None = Field(
         default=None,
         ge=0,
@@ -41,10 +41,11 @@ class StimParams(BaseModel):
         gt=0,
         description="TI: duplicate of carrier for API",
     )
-    amplitude_a: float | None = Field(
+    amplitude_ma: float | None = Field(
         default=None,
         gt=0,
-        description="TI: total peak current budget (A); control: unused (use ch1/ch2)",
+        le=10,
+        description="TI: total peak amplitude (mA); sets HS5 output voltage = this value in V (DS5: 1 mA/V); control: unused (use ch1/ch2)",
     )
     pulse_width_s: float | None = Field(
         default=None,
@@ -96,8 +97,8 @@ class StimParams(BaseModel):
                 "(or set ramp_s to 0)"
             )
         if self.mode == "ti":
-            if self.amplitude_a is None:
-                raise ValueError("TI mode requires amplitude_a")
+            if self.amplitude_ma is None:
+                raise ValueError("TI mode requires amplitude_ma")
             if self.carrier_hz is None or self.delta_f_hz is None or self.amplitude_ratio is None:
                 raise ValueError("TI mode requires carrier_hz, delta_f_hz, amplitude_ratio")
             if self.delta_f_hz == 0:
@@ -119,6 +120,7 @@ class StimParams(BaseModel):
         r1, r2 = parse_amplitude_ratio(self.amplitude_ratio)
         s = r1 + r2
         return self.carrier_hz, self.delta_f_hz, r1 / s, r2 / s
+
 
 
 class StimRequest(BaseModel):
