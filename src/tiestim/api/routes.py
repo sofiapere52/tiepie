@@ -234,11 +234,12 @@ class PreviewOut(BaseModel):
     post_stim_s: float
 
 
-_PREVIEW_MAX_SAMPLES = 100_000
+_PREVIEW_MAX_SAMPLES = 200_000
+
 
 def _preview_sample_rate(p) -> float:
     """Choose a preview sample rate high enough for visual fidelity but
-    capped so a single buffer never exceeds ~_PREVIEW_MAX_SAMPLES."""
+    capped so a single buffer stays manageable in RAM."""
     freqs = []
     if p.mode == "ti":
         if p.carrier_hz:
@@ -259,6 +260,38 @@ def _preview_sample_rate(p) -> float:
     return min(ideal, p.sample_rate_hz)
 
 
+def _decimate_minmax(
+    arrays: list[np.ndarray], t_axis: np.ndarray, max_pts: int
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Min-max envelope decimation.
+
+    Each bucket of consecutive samples contributes its min and max value,
+    preserving the true amplitude envelope even when the carrier frequency
+    is far above the display resolution.
+    """
+    n = len(t_axis)
+    if n <= max_pts:
+        return arrays, t_axis
+    n_buckets = max(1, max_pts // 2)
+    bsz = n // n_buckets
+    trim = n_buckets * bsz
+
+    t2d = t_axis[:trim].reshape(n_buckets, bsz)
+    out_t = np.empty(n_buckets * 2, dtype=t_axis.dtype)
+    out_t[0::2] = t2d[:, 0]
+    out_t[1::2] = t2d[:, -1]
+
+    out_arrays: list[np.ndarray] = []
+    for arr in arrays:
+        a2d = arr[:trim].reshape(n_buckets, bsz)
+        out = np.empty(n_buckets * 2, dtype=arr.dtype)
+        out[0::2] = a2d.min(axis=1)
+        out[1::2] = a2d.max(axis=1)
+        out_arrays.append(out)
+
+    return out_arrays, out_t
+
+
 @router.post("/waveform/preview", response_model=PreviewOut)
 async def waveform_preview(body: StimRequest):
     p = body.params
@@ -276,13 +309,14 @@ async def waveform_preview(body: StimRequest):
     sum_arr = (V1 + V2).astype(np.float64) if show_sum else None
 
     max_pts = body.preview_max_points
-    if len(V1) > max_pts:
-        stride = max(1, len(V1) // max_pts)
-        V1 = V1[::stride]
-        V2 = V2[::stride]
-        t_axis = t_axis[::stride]
-        if sum_arr is not None:
-            sum_arr = sum_arr[::stride]
+    to_dec = [V1, V2]
+    if sum_arr is not None:
+        to_dec.append(sum_arr)
+    dec_arrs, t_axis = _decimate_minmax(to_dec, t_axis, max_pts)
+    V1 = dec_arrs[0]
+    V2 = dec_arrs[1]
+    if sum_arr is not None:
+        sum_arr = dec_arrs[2]
 
     y_max = float(
         max(
