@@ -191,6 +191,23 @@ class TiePieSession(BaseSession):
             raise RuntimeError(
                 "Generator setup failed — " + "; ".join(errors)
             )
+        # Verify the hardware actually accepted the requested amplitude.
+        # libtiepie may silently clamp the value to the nearest valid range
+        # without raising an exception, so a readback is the only way to
+        # detect the discrepancy.
+        try:
+            actual_amp = float(gen.amplitude)
+            tol = max(1e-4, abs(amp_v) * 0.02)  # 2 % relative tolerance
+            if abs(actual_amp - amp_v) > tol:
+                raise RuntimeError(
+                    f"Amplitude readback mismatch: requested {amp_v:.6f} V, "
+                    f"hardware returned {actual_amp:.6f} V. "
+                    "Check the HS5 output range configuration."
+                )
+        except RuntimeError:
+            raise
+        except Exception:
+            pass  # attribute not available on this driver version — skip silently
 
     def _finish_outputs(self, burst: bool, repetitions: int) -> None:
         lt = self._lt
@@ -338,12 +355,20 @@ class TiePieSession(BaseSession):
                     self._ti_sync = False
 
         # User trigger-out on Gen1 EXT 1
+        # EXT 1 has a 1 kOhm pull-up to 2.5 V (HS5 manual §8.3).
+        # Trigger outputs are level-based: pin driven LOW while the event
+        # condition is true, HIGH (2.5 V via pull-up) otherwise.
+        #   TOE_GENERATOR_START → LOW while running  → rising edge at END
+        #   TOE_GENERATOR_STOP  → LOW while stopped  → rising edge at START
+        # The external machine triggers on the rising edge, so we use
+        # TOE_GENERATOR_STOP: the pin is held LOW after arm (generator
+        # stopped), then goes HIGH the instant gen.start() begins playback.
         if params.trigger_out:
             tout = self._find_trigger_io(g0, "output", "EXT 1")
             if tout:
                 try:
                     tout.enabled = True
-                    tout.event = lt.TOE_GENERATOR_START
+                    tout.event = lt.TOE_GENERATOR_STOP
                 except Exception:
                     pass
 
@@ -370,13 +395,16 @@ class TiePieSession(BaseSession):
         g0 = self._gens[0]
 
         try:
-            mx = g0.amplitude_max
+            mx = float(g0.amplitude_max)
             if a1 > mx:
-                raise ValueError(f"ch1 amplitude exceeds max {mx} A")
-        except (AttributeError, ValueError):
+                raise ValueError(
+                    f"ch1 amplitude {a1:.4f} V exceeds device max {mx:.4f} V"
+                )
+        except ValueError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"Could not read ch1 amplitude_max: {exc}")
         try:
             lo, hi = g0.data_length_min, g0.data_length_max
             n = len(d1)
@@ -393,13 +421,16 @@ class TiePieSession(BaseSession):
             d2 = numpy_to_array_f(wf.ch2)
             g1 = self._gens[1]
             try:
-                mx = g1.amplitude_max
+                mx = float(g1.amplitude_max)
                 if a2 > mx:
-                    raise ValueError(f"ch2 amplitude exceeds max {mx} A")
-            except (AttributeError, ValueError):
+                    raise ValueError(
+                        f"ch2 amplitude {a2:.4f} V exceeds device max {mx:.4f} V"
+                    )
+            except ValueError:
                 raise
-            except Exception:
-                pass
+            except Exception as exc:
+                import warnings
+                warnings.warn(f"Could not read ch2 amplitude_max: {exc}")
             self._prepare_gen(g1, d2, wf.sample_rate_hz, a2)
 
         lt = self._lt
