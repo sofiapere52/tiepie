@@ -6,7 +6,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
   <title>TiePie HS5 GUI</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.min.css" />
-  <link rel="stylesheet" href="/style.css?v=4" />
+  <link rel="stylesheet" href="/style.css?v=10" />
 </head>
 <body>
   <header>
@@ -86,6 +86,7 @@
     <label>Post-stim silence (s) <input type="number" id="post_stim_s" value="0" step="any" min="0" /></label>
     <label>Ramp up/down (s each) <input type="number" id="ramp_s" value="0" step="any" min="0" /></label>
     <p class="readonly-field">Total time per cycle (s): <strong id="total_time_display">0.1</strong> <span class="hint">(pre + stim + post)</span></p>
+    <p class="readonly-field">Hardware sample rate: <strong id="sample_rate_display">—</strong> Hz <span id="sample_rate_hint" class="hint"></span></p>
     <label>Repetitions (0 = continuous) <input type="number" id="repetitions" value="1" step="1" min="0" /></label>
     <div class="trigger-row">
       <label class="ch-toggle"><input type="checkbox" id="trigger_out" /> Trigger Out (EXT 1)</label>
@@ -94,9 +95,9 @@
     <button type="button" id="btn-preview">Preview waveform</button>
   </section>
 
-  <section class="preview">
+  <section id="preview-section" class="preview">
     <h2>Preview</h2>
-    <p class="hint">Scroll wheel zooms; drag to pan. Shows full repetition train.</p>
+    <p class="hint">Put the pointer over a plot and scroll the wheel to zoom the time axis (page scrolling and Ctrl+page zoom are blocked there). Drag to pan; double-click to reset. The preview never uses a higher sampling rate than the hardware will for these settings. All three plots stay in sync. After you zoom in, wait a second or two for the plot to update: the app refetches that time window at the real hardware sample rate so you see the genuine waveform, not a coarse overview.</p>
     <div id="u-ch1" class="uplot-wrap"></div>
     <div id="u-ch2" class="uplot-wrap"></div>
     <div id="u-sum" class="uplot-wrap hidden"></div>
@@ -107,7 +108,7 @@
     <pre id="log-panel"></pre>
   </section>
 
-  <script src="/app.js?v=4"></script>
+  <script src="/app.js?v=10"></script>
   <script src="https://cdn.jsdelivr.net/npm/uplot@1.6.30/dist/uPlot.iife.min.js" defer></script>
 </body>
 </html>

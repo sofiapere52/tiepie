@@ -18,6 +18,92 @@ class WaveformPair:
     n_samples: int
 
 
+# ---- HS5 hardware constraints ------------------------------------------------
+# AWG memory per channel (samples). Exceeding this causes libtiepie to refuse
+# the buffer with "buffer length N not in [1, 67108864]".
+HS5_BUFFER_MAX = 67_108_864
+# Hardware ceiling for the AWG sample rate. The HS5 TG-AWG nominally goes up to
+# ~240 MS/s; we use this only as an upper bound — most stimulation frequencies
+# pick a much lower rate.
+HS5_MAX_SR = 240_000_000
+# Target visual / signal fidelity: at least this many samples per period of the
+# highest signal frequency. Square waves benefit from more, but 50 keeps edges
+# under ~2 % of the period and is plenty for the analog smoothing of the HS5.
+TARGET_SAMPLES_PER_CYCLE = 50
+# Hard floor — below this the waveform stops resembling the requested shape and
+# we refuse to play it at all (the user must shorten the run, lower the
+# frequency, or use repetitions).
+MIN_SAMPLES_PER_CYCLE = 10
+
+
+def _max_signal_frequency_hz(p: StimParams) -> float:
+    """Highest signal frequency present in the requested stimulation."""
+    freqs: list[float] = []
+    if p.mode == "ti":
+        if p.carrier_hz is not None and p.carrier_hz > 0:
+            freqs.append(float(p.carrier_hz))
+            if p.delta_f_hz is not None:
+                freqs.append(abs(float(p.carrier_hz) + float(p.delta_f_hz)))
+    else:
+        if p.ch1 is not None and p.ch1.enabled and p.ch1.frequency_hz > 0:
+            freqs.append(float(p.ch1.frequency_hz))
+        if p.ch2 is not None and p.ch2.enabled and p.ch2.frequency_hz > 0:
+            freqs.append(float(p.ch2.frequency_hz))
+    return max(freqs) if freqs else 1.0
+
+
+def choose_hardware_sample_rate(p: StimParams) -> tuple[float, str]:
+    """Pick a hardware AWG sample rate that meets two constraints:
+
+    1. Fits the HS5 internal buffer (one buffer holds ``total_time_s * sr``
+       samples, must be ≤ ``HS5_BUFFER_MAX``).
+    2. Keeps at least ``TARGET_SAMPLES_PER_CYCLE`` samples per period of the
+       highest signal frequency for a clean waveform.
+
+    Returns ``(sample_rate_hz, note)``. The ``note`` is empty when the chosen
+    rate meets the fidelity target; otherwise it is a short human-readable
+    string explaining why a lower rate had to be used (so the GUI / live log
+    can surface it).
+
+    Raises ``ValueError`` when the buffer cannot accommodate even
+    ``MIN_SAMPLES_PER_CYCLE`` samples per period — in that case there is no
+    rate at which the requested run is reproducible, and the message tells
+    the user what to change.
+    """
+    fmax = _max_signal_frequency_hz(p)
+    total = p.total_time_s
+
+    ideal = min(HS5_MAX_SR, fmax * TARGET_SAMPLES_PER_CYCLE)
+    sr = ideal
+    note = ""
+
+    if total > 0:
+        buffer_cap_sr = HS5_BUFFER_MAX / total
+        if buffer_cap_sr < ideal:
+            sr = buffer_cap_sr
+            sps = sr / fmax if fmax > 0 else float("inf")
+            note = (
+                f"reduced from {ideal:,.0f} Hz to fit the {HS5_BUFFER_MAX:,d}-sample "
+                f"AWG buffer ({sps:.1f} samples/period at {fmax:g} Hz)"
+            )
+
+    sps = sr / fmax if fmax > 0 else float("inf")
+    if sps < MIN_SAMPLES_PER_CYCLE:
+        max_total_at_min = (
+            HS5_BUFFER_MAX / (MIN_SAMPLES_PER_CYCLE * fmax)
+            if fmax > 0
+            else float("inf")
+        )
+        raise ValueError(
+            f"Cannot represent this stimulation accurately: {total:g} s at "
+            f"{fmax:g} Hz would force the AWG to {sps:.2f} samples per period "
+            f"(minimum {MIN_SAMPLES_PER_CYCLE}). Reduce the total time below "
+            f"{max_total_at_min:.1f} s, lower the highest signal frequency, or "
+            f"split the run into hardware repetitions of a shorter buffer."
+        )
+    return float(sr), note
+
+
 def _active_window(n_total: int, pre: int, post: int) -> tuple[int, int]:
     end = n_total - post
     if pre >= end or pre < 0:

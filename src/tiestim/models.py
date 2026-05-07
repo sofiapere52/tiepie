@@ -101,8 +101,12 @@ class StimParams(BaseModel):
                 raise ValueError("TI mode requires amplitude_ma")
             if self.carrier_hz is None or self.delta_f_hz is None or self.amplitude_ratio is None:
                 raise ValueError("TI mode requires carrier_hz, delta_f_hz, amplitude_ratio")
-            if self.delta_f_hz == 0:
-                raise ValueError("delta_f_hz must be non-zero in TI mode")
+            # delta_f_hz == 0 is allowed: both channels run at the carrier in
+            # anti-phase, the sum collapses to zero (or to the imbalance set
+            # by amplitude_ratio). TBS, however, needs a non-zero beat to
+            # define the burst duration (3/|Δf|).
+            if self.shape == "tbs" and (self.delta_f_hz is None or self.delta_f_hz == 0):
+                raise ValueError("TBS shape requires a non-zero delta_f_hz")
             if self.shape == "tbs" and self.tbs_freq_hz is None:
                 raise ValueError("TBS shape requires tbs_freq_hz (2–8 Hz)")
         else:
@@ -125,4 +129,11 @@ class StimParams(BaseModel):
 
 class StimRequest(BaseModel):
     params: StimParams
-    preview_max_points: int = Field(default=2000, ge=64, le=50_000)
+    preview_max_points: int = Field(default=8000, ge=64, le=200_000)
+    # Optional zoom window. When BOTH are provided and define a sub-range of
+    # the full stimulation, the /waveform/preview endpoint switches to a
+    # windowed render that builds carrier-resolved data only for this slice
+    # — the same memory budget then yields enough density to show a clean
+    # sinusoid when the user zooms in deep on the live preview.
+    t_start_s: float | None = Field(default=None, ge=0)
+    t_end_s: float | None = Field(default=None, ge=0)

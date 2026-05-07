@@ -13,7 +13,13 @@ from pydantic import BaseModel
 from tiestim.logger import append_stim_row, row_from_params
 from tiestim.models import StimParams, StimRequest
 from tiestim.session import BaseSession
-from tiestim.waveform import build_waveforms, peak_amplitudes, waveform_to_amps
+from tiestim.waveform import (
+    _max_signal_frequency_hz,
+    build_waveforms,
+    choose_hardware_sample_rate,
+    peak_amplitudes,
+    waveform_to_amps,
+)
 
 router = APIRouter()
 
@@ -225,6 +231,7 @@ class PreviewOut(BaseModel):
     t_seconds: list[float]
     cycle_duration_s: float
     n_cycles_shown: int
+    n_cycles_requested: int
     t_total_plot_s: float
     y_max: float
     mode: str
@@ -232,32 +239,43 @@ class PreviewOut(BaseModel):
     pre_stim_s: float
     stim_time_s: float
     post_stim_s: float
+    hw_sample_rate_hz: float
+    hw_sample_rate_note: str = ""
+    preview_sample_rate_hz: float
 
 
-_PREVIEW_MAX_SAMPLES = 200_000
+# Max source samples allocated for **one cycle** of preview (overview or
+# zoom). Chosen so a typical long TI run (e.g. 120 s @ ~100 kHz ≈ 12.1 M
+# samples) still builds at the **hardware** sample rate; going far above
+# that only wastes RAM without exceeding what the AWG will output.
+_PREVIEW_SOURCE_BUDGET_SAMPLES_PER_CYCLE = 20_000_000
+# Target source density: samples per period of the highest signal frequency
+# (capped by hardware rate and the budget above).
+_PREVIEW_TARGET_SAMPLES_PER_CYCLE = 50
 
 
-def _preview_sample_rate(p) -> float:
-    """Choose a preview sample rate high enough for visual fidelity but
-    capped so a single buffer stays manageable in RAM."""
-    freqs = []
-    if p.mode == "ti":
-        if p.carrier_hz:
-            freqs.append(p.carrier_hz)
-        if p.carrier_hz and p.delta_f_hz:
-            freqs.append(abs(p.carrier_hz + p.delta_f_hz))
-    else:
-        if p.ch1 and p.ch1.enabled:
-            freqs.append(p.ch1.frequency_hz)
-        if p.ch2 and p.ch2.enabled:
-            freqs.append(p.ch2.frequency_hz)
-    max_f = max(freqs) if freqs else 100.0
-    ideal = max_f * 200
+def _preview_source_sr(
+    p: StimParams,
+    *,
+    source_budget: int,
+    hw_sr_cap: float,
+) -> float:
+    """Pick the source sample rate for building preview waveform samples.
+
+    The preview **never samples denser than the AWG will** for these
+    parameters: the result is ``min(ideal, hw_sr_cap)`` where ``ideal`` comes
+    from a fidelity target and an optional per-cycle sample budget.
+
+    ``p.sample_rate_hz`` is ignored here — pass the hardware rate explicitly
+    as ``hw_sr_cap`` so this cannot drift from ``choose_hardware_sample_rate``.
+    """
+    fmax = _max_signal_frequency_hz(p)
+    ideal = fmax * _PREVIEW_TARGET_SAMPLES_PER_CYCLE
     total_s = p.total_time_s
-    if total_s > 0 and ideal * total_s > _PREVIEW_MAX_SAMPLES:
-        ideal = _PREVIEW_MAX_SAMPLES / total_s
-    ideal = max(ideal, max_f * 4)
-    return min(ideal, p.sample_rate_hz)
+    if total_s > 0 and ideal * total_s > source_budget:
+        ideal = source_budget / total_s
+    ideal = max(ideal, fmax * 4)
+    return float(min(ideal, hw_sr_cap))
 
 
 def _decimate_minmax(
@@ -292,62 +310,219 @@ def _decimate_minmax(
     return out_arrays, out_t
 
 
-@router.post("/waveform/preview", response_model=PreviewOut)
-async def waveform_preview(body: StimRequest):
-    p = body.params
-    preview_sr = _preview_sample_rate(p)
-    preview_params = p.model_copy(update={"sample_rate_hz": preview_sr})
-    wf = build_waveforms(preview_params)
-    a1, a2 = peak_amplitudes(preview_params)
-    v1, v2 = waveform_to_amps(wf, a1, a2)
-    n_cycles = int(p.repetitions) if p.repetitions > 0 else 1
-    n_cycles = min(n_cycles, 3)
-    V1 = np.tile(v1, n_cycles)
-    V2 = np.tile(v2, n_cycles)
-    t_axis = np.arange(len(V1), dtype=np.float64) / preview_sr
-    show_sum = p.mode == "ti"
-    sum_arr = (V1 + V2).astype(np.float64) if show_sum else None
-
-    max_pts = body.preview_max_points
-    to_dec = [V1, V2]
-    if sum_arr is not None:
-        to_dec.append(sum_arr)
-    dec_arrs, t_axis = _decimate_minmax(to_dec, t_axis, max_pts)
-    V1 = dec_arrs[0]
-    V2 = dec_arrs[1]
-    if sum_arr is not None:
-        sum_arr = dec_arrs[2]
-
+def _build_preview_response(
+    p: StimParams,
+    *,
+    hw_sr: float,
+    hw_note: str,
+    preview_sr: float,
+    n_cycles_requested: int,
+    n_cycles_shown: int,
+    show_sum: bool,
+    t: np.ndarray,
+    v1: np.ndarray,
+    v2: np.ndarray,
+    sum_arr: np.ndarray | None,
+) -> PreviewOut:
+    """Pack the decimated arrays into the wire format. Centralised so the
+    overview and windowed branches return identical shapes."""
     y_max = float(
         max(
-            np.max(np.abs(V1)) if len(V1) else 0.0,
-            np.max(np.abs(V2)) if len(V2) else 0.0,
+            np.max(np.abs(v1)) if len(v1) else 0.0,
+            np.max(np.abs(v2)) if len(v2) else 0.0,
             np.max(np.abs(sum_arr)) if sum_arr is not None and len(sum_arr) else 0.0,
         )
     )
     if y_max <= 0:
         y_max = 1.0
-    t_l = t_axis.tolist()
-    c1 = V1.tolist()
-    c2 = V2.tolist()
-    sum_l: list[float] | None = None
-    if sum_arr is not None:
-        sum_l = sum_arr.tolist()
     return PreviewOut(
-        ch1=c1,
-        ch2=c2,
-        sum_v=sum_l,
-        t_seconds=t_l,
+        ch1=v1.tolist(),
+        ch2=v2.tolist(),
+        sum_v=sum_arr.tolist() if sum_arr is not None else None,
+        t_seconds=t.tolist(),
         cycle_duration_s=p.total_time_s,
-        n_cycles_shown=n_cycles,
-        t_total_plot_s=float(t_axis[-1]) if len(t_axis) else 0.0,
+        n_cycles_shown=n_cycles_shown,
+        n_cycles_requested=n_cycles_requested,
+        t_total_plot_s=float(t[-1] - t[0]) if len(t) else 0.0,
         y_max=y_max,
         mode=p.mode,
         show_sum=show_sum,
         pre_stim_s=p.pre_stim_s,
         stim_time_s=p.stim_time_s,
         post_stim_s=p.post_stim_s,
+        hw_sample_rate_hz=hw_sr,
+        hw_sample_rate_note=hw_note,
+        preview_sample_rate_hz=preview_sr,
     )
+
+
+@router.post("/waveform/preview", response_model=PreviewOut)
+async def waveform_preview(body: StimRequest):
+    p = body.params
+
+    # Match what the hardware will actually do: replace the user's nominal
+    # sample rate with the auto-picked one. If the request fails the fidelity
+    # floor (would also fail at /arm), surface the same error here so the
+    # user sees it before hitting Load.
+    try:
+        hw_sr, hw_note = choose_hardware_sample_rate(p)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    p_hw = p.model_copy(update={"sample_rate_hz": hw_sr})
+
+    n_cycles_requested = int(p.repetitions) if p.repetitions > 0 else 1
+    cycle_dur = float(p.total_time_s)
+    total_dur = cycle_dur * max(1, n_cycles_requested)
+    show_sum = p.mode == "ti"
+
+    # ---- Windowed (zoom) mode ------------------------------------------------
+    # Triggered when both endpoints of a meaningful sub-range are provided.
+    # We build ONE cycle at a higher source sample rate (memory: bounded by
+    # `_PREVIEW_SOURCE_ZOOM_MAX_SAMPLES`) and slice the touched cycles to
+    # exactly the requested window. Because the window is small, the carrier
+    # appears smooth even at deep zoom — that is the whole point of this
+    # branch.
+    if (
+        body.t_start_s is not None
+        and body.t_end_s is not None
+        and body.t_end_s > body.t_start_s
+        and cycle_dur > 0
+    ):
+        t0 = max(0.0, float(body.t_start_s))
+        t1 = min(total_dur, float(body.t_end_s))
+        # Only treat as a "real" zoom when the window is a meaningful slice.
+        # Within ~0.1 % of the full extent, fall through to overview to avoid
+        # spurious zoom-mode renders on the initial draw.
+        if t1 > t0 and (t1 - t0) < total_dur * 0.999:
+            preview_sr = _preview_source_sr(
+                p_hw,
+                source_budget=_PREVIEW_SOURCE_BUDGET_SAMPLES_PER_CYCLE,
+                hw_sr_cap=hw_sr,
+            )
+            preview_params = p_hw.model_copy(update={"sample_rate_hz": preview_sr})
+            wf = build_waveforms(preview_params)
+            a1, a2 = peak_amplitudes(preview_params)
+            v1_one, v2_one = waveform_to_amps(wf, a1, a2)
+            n_per_cycle = len(v1_one)
+            t_one = np.arange(n_per_cycle, dtype=np.float64) / preview_sr
+            sum_one = (v1_one + v2_one).astype(np.float64) if show_sum else None
+
+            kmin = max(0, int(t0 // cycle_dur))
+            kmax = min(n_cycles_requested - 1, int(t1 // cycle_dur))
+            v1_parts, v2_parts, sum_parts, t_parts = [], [], [], []
+            for k in range(kmin, kmax + 1):
+                cstart = max(0.0, t0 - k * cycle_dur)
+                cend = min(cycle_dur, t1 - k * cycle_dur)
+                i0 = int(np.floor(cstart * preview_sr))
+                i1 = min(n_per_cycle, int(np.ceil(cend * preview_sr)))
+                if i1 <= i0:
+                    continue
+                v1_parts.append(v1_one[i0:i1])
+                v2_parts.append(v2_one[i0:i1])
+                if sum_one is not None:
+                    sum_parts.append(sum_one[i0:i1])
+                t_parts.append(t_one[i0:i1] + k * cycle_dur)
+
+            if not t_parts:
+                # Window fell entirely outside any built sample (defensive;
+                # the kmin/kmax computation makes this essentially unreachable).
+                big_t = np.array([t0, t1], dtype=np.float64)
+                big_v1 = np.zeros(2)
+                big_v2 = np.zeros(2)
+                big_sum = np.zeros(2) if show_sum else None
+            else:
+                big_t = np.concatenate(t_parts)
+                big_v1 = np.concatenate(v1_parts)
+                big_v2 = np.concatenate(v2_parts)
+                big_sum = np.concatenate(sum_parts) if sum_parts else None
+
+            to_dec = [big_v1, big_v2]
+            if big_sum is not None:
+                to_dec.append(big_sum)
+            dec_arrs, big_t = _decimate_minmax(to_dec, big_t, body.preview_max_points)
+            big_v1, big_v2 = dec_arrs[0], dec_arrs[1]
+            if big_sum is not None:
+                big_sum = dec_arrs[2]
+
+            return _build_preview_response(
+                p,
+                hw_sr=hw_sr,
+                hw_note=hw_note,
+                preview_sr=preview_sr,
+                n_cycles_requested=n_cycles_requested,
+                n_cycles_shown=(kmax - kmin + 1),
+                show_sum=show_sum,
+                t=big_t,
+                v1=big_v1,
+                v2=big_v2,
+                sum_arr=big_sum,
+            )
+
+    # ---- Overview mode -------------------------------------------------------
+    # Build ONE cycle, decimate it to `pts_per_cycle = max_pts // n_cycles`
+    # display points, and tile that decimated cycle in display space. This
+    # keeps source memory bounded by a single cycle no matter how many
+    # repetitions the user asked for, so all reps are always shown.
+    preview_sr = _preview_source_sr(
+        p_hw,
+        source_budget=_PREVIEW_SOURCE_BUDGET_SAMPLES_PER_CYCLE,
+        hw_sr_cap=hw_sr,
+    )
+    preview_params = p_hw.model_copy(update={"sample_rate_hz": preview_sr})
+    wf = build_waveforms(preview_params)
+    a1, a2 = peak_amplitudes(preview_params)
+    v1_one, v2_one = waveform_to_amps(wf, a1, a2)
+    n_per_cycle = len(v1_one)
+    t_one = np.arange(n_per_cycle, dtype=np.float64) / preview_sr
+    sum_one = (v1_one + v2_one).astype(np.float64) if show_sum else None
+
+    n_cycles = max(1, n_cycles_requested)
+    pts_per_cycle = max(2, body.preview_max_points // n_cycles)
+
+    to_dec = [v1_one, v2_one]
+    if sum_one is not None:
+        to_dec.append(sum_one)
+    dec_arrs, dec_t = _decimate_minmax(to_dec, t_one, pts_per_cycle)
+    n_pts = len(dec_t)
+
+    big_t = np.empty(n_pts * n_cycles, dtype=np.float64)
+    for i in range(n_cycles):
+        big_t[i * n_pts : (i + 1) * n_pts] = dec_t + i * cycle_dur
+    big_v1 = np.tile(dec_arrs[0], n_cycles)
+    big_v2 = np.tile(dec_arrs[1], n_cycles)
+    big_sum = np.tile(dec_arrs[2], n_cycles) if sum_one is not None else None
+
+    return _build_preview_response(
+        p,
+        hw_sr=hw_sr,
+        hw_note=hw_note,
+        preview_sr=preview_sr,
+        n_cycles_requested=n_cycles_requested,
+        n_cycles_shown=n_cycles,
+        show_sum=show_sum,
+        t=big_t,
+        v1=big_v1,
+        v2=big_v2,
+        sum_arr=big_sum,
+    )
+
+
+@router.post("/plan")
+async def plan(params: StimParams):
+    """Return the hardware sample rate that would be used for these params,
+    plus an optional human-readable note. Used by the GUI to show the chosen
+    rate next to the total-time display, without building a waveform."""
+    try:
+        sr, note = choose_hardware_sample_rate(params)
+        return {
+            "ok": True,
+            "sample_rate_hz": sr,
+            "sample_rate_note": note,
+            "total_time_s": params.total_time_s,
+            "buffer_samples": int(round(params.total_time_s * sr)),
+        }
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @router.post("/arm")
@@ -357,9 +532,19 @@ async def arm(request: Request, params: StimParams):
     sess: BaseSession = request.app.state.session
     schedule_log(request.app, "Loading waveforms to device(s)…")
     try:
-        wf = build_waveforms(params)
-        sess.arm(params, wf)
-        _last_params = params
+        # Auto-select an HS5 sample rate that fits the AWG buffer and gives
+        # at least TARGET_SAMPLES_PER_CYCLE samples per period of the highest
+        # signal frequency. Whatever the user/UI sent in `params.sample_rate_hz`
+        # is overridden by the chosen value so long stimulations no longer
+        # overflow the 64 Mi-sample buffer.
+        sr, note = choose_hardware_sample_rate(params)
+        eff = params.model_copy(update={"sample_rate_hz": sr})
+        wf = build_waveforms(eff)
+        sess.arm(eff, wf)
+        # Store the effective params (with the chosen sample rate) so the CSV
+        # log column `sample_rate_hz` reflects what actually played, not the
+        # value originally posted by the GUI.
+        _last_params = eff
         request.app.state.last_error = None
     except Exception as e:
         request.app.state.last_error = str(e)
@@ -367,13 +552,17 @@ async def arm(request: Request, params: StimParams):
         schedule_log(request.app, f"Load failed: {e}")
         raise HTTPException(400, str(e)) from e
     await broadcast(request.app)
+    sr_msg = f"Hardware sample rate: {sr:,.0f} Hz"
+    if note:
+        sr_msg += f"  ({note})"
+    schedule_log(request.app, sr_msg)
     schedule_log(request.app, "Loaded — ready for Start")
     if params.mode == "ti":
         schedule_log(
             request.app,
             "TI sync active — ensure CMI cable connects both HS5 units",
         )
-    return {"ok": True}
+    return {"ok": True, "sample_rate_hz": sr, "sample_rate_note": note}
 
 
 @router.post("/start")

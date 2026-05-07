@@ -178,6 +178,8 @@ input, select {
   margin-bottom: 0.5rem;
   width: 100%;
   overflow: hidden;
+  /* Keep wheel gestures from chaining to the page when zooming the chart */
+  overscroll-behavior: contain;
 }
 .uplot-wrap > .uplot {
   width: 100% !important;

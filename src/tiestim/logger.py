@@ -71,7 +71,9 @@ class StimLogRow:
 def append_stim_row(row: StimLogRow) -> Path:
     d = log_dir()
     d.mkdir(parents=True, exist_ok=True)
-    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    # Use local wall-clock date for the daily file so a stim at 23:30 local
+    # time stays in the same file as the rest of that evening's runs.
+    day = datetime.now().astimezone().strftime("%Y%m%d")
     path = d / f"stim_{day}.csv"
     new_file = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as f:
