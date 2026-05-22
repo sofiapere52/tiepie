@@ -31,6 +31,22 @@ class StimLogRow:
     post_stim_s: float
     ramp_s: float
     repetitions: int
+    trigger_out: bool
+    trigger_in: bool
+    trigger_stimulation: bool
+    session_marker_emitted: bool
+    # fUS-specific columns. Populated only when mode == "fus"; left as None
+    # (= blank cell in CSV) for Control/TI runs so the daily file stays
+    # readable for non-fUS workflows.
+    fus_channel: int | None
+    fus_carrier_hz: float | None
+    fus_prf_hz: float | None
+    fus_prf_duty: float | None
+    fus_tone_burst_s: float | None
+    fus_sonication_duration_s: float | None
+    fus_isi_off_s: float | None
+    fus_n_pulses: int | None
+    fus_amplitude_mv_pp: float | None
     device_1_serial: str
     device_2_serial: str
     outcome: str
@@ -57,6 +73,19 @@ class StimLogRow:
             "post_stim_s",
             "ramp_s",
             "repetitions",
+            "trigger_out",
+            "trigger_in",
+            "trigger_stimulation",
+            "session_marker_emitted",
+            "fus_channel",
+            "fus_carrier_hz",
+            "fus_prf_hz",
+            "fus_prf_duty",
+            "fus_tone_burst_s",
+            "fus_sonication_duration_s",
+            "fus_isi_off_s",
+            "fus_n_pulses",
+            "fus_amplitude_mv_pp",
             "device_1_serial",
             "device_2_serial",
             "outcome",
@@ -99,6 +128,14 @@ def row_from_params(
         shape = params.shape
         amp = float(params.amplitude_ma) if params.amplitude_ma is not None else 0.0
         pulse = params.pulse_width_s
+    elif params.mode == "fus":
+        # fUS reports its carrier in the dedicated fUS columns; the legacy
+        # frequency/shape fields are kept generic so the file remains parseable
+        # by tooling expecting the original schema.
+        shape = "fus-sine"
+        freq = None
+        amp = 0.0
+        pulse = None
     else:
         assert params.ch1 is not None and params.ch2 is not None
         freq = params.ch1.frequency_hz
@@ -108,6 +145,8 @@ def row_from_params(
             params.ch2.amplitude_ma if params.ch2.enabled else 0.0,
         )
         pulse = params.ch1.pulse_width_s or params.ch2.pulse_width_s
+
+    fus = params.fus if params.mode == "fus" else None
     return StimLogRow(
         timestamp_utc=now.isoformat(),
         timestamp_local=local.isoformat(),
@@ -126,6 +165,19 @@ def row_from_params(
         post_stim_s=params.post_stim_s,
         ramp_s=params.ramp_s,
         repetitions=params.repetitions,
+        trigger_out=bool(params.trigger_out),
+        trigger_in=bool(params.trigger_in),
+        trigger_stimulation=bool(getattr(params, "trigger_stimulation", False)),
+        session_marker_emitted=bool(params.trigger_in or params.trigger_out),
+        fus_channel=(fus.channel if fus else None),
+        fus_carrier_hz=(fus.carrier_hz if fus else None),
+        fus_prf_hz=(fus.prf_hz if fus else None),
+        fus_prf_duty=(fus.prf_duty if fus else None),
+        fus_tone_burst_s=(fus.tone_burst_s if fus else None),
+        fus_sonication_duration_s=(fus.sonication_duration_s if fus else None),
+        fus_isi_off_s=(fus.isi_off_s if fus else None),
+        fus_n_pulses=(fus.n_pulses if fus else None),
+        fus_amplitude_mv_pp=(fus.amplitude_mv_pp if fus else None),
         device_1_serial=serial1,
         device_2_serial=serial2,
         outcome=outcome,

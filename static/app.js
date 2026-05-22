@@ -36,7 +36,50 @@ function collectParams() {
     repetitions: intv("repetitions", 1),
     trigger_out: byId("trigger_out") ? byId("trigger_out").checked : false,
     trigger_in: byId("trigger_in") ? byId("trigger_in").checked : false,
+    trigger_stimulation: byId("trigger_stimulation") ? byId("trigger_stimulation").checked : false,
   };
+  if (mode === "fus") {
+    const fusCarrierHz = num("fus_carrier_mhz", 1.0) * 1e6;
+    const fusPrfHz = num("fus_prf_hz", 1000);
+    const fusDuty = num("fus_prf_duty", 0.5);
+    const fusToneBurstS = num("fus_tone_burst_us", 500) * 1e-6;
+    const fusSdS = num("fus_sd_ms", 300) * 1e-3;
+    const fusIsiOffS = num("fus_isi_off_ms", 200) * 1e-3;
+    const fusNPulses = Math.max(1, intv("fus_n_pulses", 1));
+    const fusAmpMvPp = num("fus_amplitude_mv_pp", 200);
+    const ch1Radio = byId("fus_channel_1");
+    const fusChannel = ch1Radio && ch1Radio.checked ? 1 : 2;
+    const isi = fusSdS + fusIsiOffS;
+    return {
+      params: {
+        ...common,
+        // The server snaps stim_time_s to n_pulses × ISI in the validator;
+        // we send the derived value here to keep the wire payload self-
+        // consistent.
+        stim_time_s: fusNPulses * isi,
+        shape: "sine",
+        amplitude_ma: null,
+        frequency_hz: null,
+        carrier_hz: null,
+        delta_f_hz: null,
+        amplitude_ratio: null,
+        ch1: null,
+        ch2: null,
+        fus: {
+          channel: fusChannel,
+          carrier_hz: fusCarrierHz,
+          prf_hz: fusPrfHz,
+          prf_duty: fusDuty,
+          tone_burst_s: fusToneBurstS,
+          sonication_duration_s: fusSdS,
+          isi_off_s: fusIsiOffS,
+          n_pulses: fusNPulses,
+          amplitude_mv_pp: fusAmpMvPp,
+        },
+      },
+      preview_max_points: 50000,
+    };
+  }
   if (mode === "ti") {
     const carrier = num("carrier_hz", 2000);
     const tiShape = (byId("ti_shape") || {}).value || "sine";
@@ -110,6 +153,10 @@ function maxSignalFrequencyFromUI(params) {
         freqs.push(Math.abs(params.carrier_hz + params.delta_f_hz));
       }
     }
+  } else if (params.mode === "fus") {
+    if (params.fus && params.fus.carrier_hz > 0) {
+      freqs.push(params.fus.carrier_hz);
+    }
   } else {
     if (params.ch1 && params.ch1.enabled && params.ch1.frequency_hz > 0) {
       freqs.push(params.ch1.frequency_hz);
@@ -121,14 +168,23 @@ function maxSignalFrequencyFromUI(params) {
   return freqs.length ? Math.max.apply(null, freqs) : 1.0;
 }
 
+function bufferDurationFromUI(params) {
+  // Mirror of waveform._buffer_duration_s. Pre/post are software waits, so
+  // the AWG buffer holds only stim samples — or one ISI cycle for fUS.
+  if (params.mode === "fus" && params.fus) {
+    return (params.fus.sonication_duration_s || 0) + (params.fus.isi_off_s || 0);
+  }
+  return params.stim_time_s || 0;
+}
+
 function chooseHardwareSampleRate(params) {
   const fmax = maxSignalFrequencyFromUI(params);
-  const total = (params.pre_stim_s || 0) + (params.stim_time_s || 0) + (params.post_stim_s || 0);
+  const bufDur = bufferDurationFromUI(params);
   let ideal = Math.min(HS5_MAX_SR, fmax * HS5_TARGET_SAMPLES_PER_CYCLE);
   let sr = ideal;
   let note = "";
-  if (total > 0) {
-    const cap = HS5_BUFFER_MAX / total;
+  if (bufDur > 0) {
+    const cap = HS5_BUFFER_MAX / bufDur;
     if (cap < ideal) {
       sr = cap;
       const sps = sr / fmax;
@@ -138,12 +194,36 @@ function chooseHardwareSampleRate(params) {
   const sps = fmax > 0 ? sr / fmax : Infinity;
   if (sps < HS5_MIN_SAMPLES_PER_CYCLE) {
     const maxT = HS5_BUFFER_MAX / (HS5_MIN_SAMPLES_PER_CYCLE * fmax);
+    const what = params.mode === "fus" ? "ISI cycle (SD + isi_off)" : "stim time";
     return {
       ok: false,
-      message: `Total time too long for ${fmax.toLocaleString()} Hz signal — buffer would hold ${sps.toFixed(2)} samples/period (min ${HS5_MIN_SAMPLES_PER_CYCLE}). Reduce total time below ${maxT.toFixed(1)} s, lower the frequency, or split into repetitions.`,
+      message: `${what} too long for ${fmax.toLocaleString()} Hz signal — buffer would hold ${sps.toFixed(2)} samples/period (min ${HS5_MIN_SAMPLES_PER_CYCLE}). Reduce ${what} below ${maxT.toFixed(3)} s, lower the carrier, or split into repetitions.`,
     };
   }
   return { ok: true, sr, note };
+}
+
+const SESSION_PROLOGUE_MIN_PRE_STIM_S = 0.105;
+
+function updateTriggerPrologueValidation() {
+  const hintEl = byId("trigger-prologue-hint");
+  const errEl = byId("trigger-prologue-error");
+  const tOut = byId("trigger_out");
+  const tIn = byId("trigger_in");
+  const preEl = byId("pre_stim_s");
+  if (!hintEl || !errEl || !preEl) return;
+  const needsPrologue = (tOut && tOut.checked) || (tIn && tIn.checked);
+  hintEl.classList.toggle("hidden", !needsPrologue);
+  const pre = parseFloat(preEl.value) || 0;
+  if (needsPrologue && pre < SESSION_PROLOGUE_MIN_PRE_STIM_S - 1e-9) {
+    errEl.textContent =
+      `pre_stim is ${pre.toFixed(3)} s — must be ≥ ${SESSION_PROLOGUE_MIN_PRE_STIM_S.toFixed(3)} s when Trigger In or Trigger Out is on ` +
+      `(the session needs ~5 ms for the marker pulse plus ~100 ms USB safety to reload the stim buffer).`;
+    errEl.classList.remove("hidden");
+  } else {
+    errEl.classList.add("hidden");
+    errEl.textContent = "";
+  }
 }
 
 function updateSampleRateDisplay() {
@@ -202,6 +282,20 @@ function applySingleDeviceRestrictions(payload) {
       ch2Enabled.disabled = true;
     } else {
       ch2Enabled.disabled = false;
+    }
+  }
+  // fUS channel selector: lock to Channel 1 when only one HS5 is connected.
+  const fusCh1 = byId("fus_channel_1");
+  const fusCh2 = byId("fus_channel_2");
+  const fusHint = byId("fus-channel-hint");
+  if (fusCh1 && fusCh2) {
+    if (singleDevice) {
+      fusCh1.checked = true;
+      fusCh2.disabled = true;
+      if (fusHint) fusHint.textContent = "Only HS5 #1 detected — Channel 1 is the only option.";
+    } else {
+      fusCh2.disabled = false;
+      if (fusHint) fusHint.textContent = "Two HS5s connected. The other channel stays free (e.g. for gating).";
     }
   }
 }
@@ -558,6 +652,10 @@ function drawPreviewUplot(out) {
   previewState.totalT1 = t && t.length ? t[t.length - 1] : 0;
   previewState.inOverview = true;
 
+  // Unit label: mA for current-drive (Control/TI/TBS, via DS5), V for fUS.
+  const isFus = out.mode === "fus";
+  const yUnit = isFus ? "V" : "mA";
+
   const opts = (title, stroke) => ({
     width: w,
     height: 320,
@@ -570,10 +668,10 @@ function drawPreviewUplot(out) {
       x: { time: false },
       y: { range: [-yMax * 1.08, yMax * 1.08] },
     },
-    series: [{}, { stroke, width: 1, label: "mA" }],
+    series: [{}, { stroke, width: 1, label: yUnit }],
     axes: [
       { stroke: "#8b949e", grid: { stroke: "#30363d22" }, label: "Time (s)", size: 32 },
-      { stroke: "#8b949e", grid: { stroke: "#30363d22" }, label: "Amplitude (mA)", size: 60 },
+      { stroke: "#8b949e", grid: { stroke: "#30363d22" }, label: `Amplitude (${yUnit})`, size: 60 },
     ],
     legend: { show: false },
     plugins: [makeZoomPanPlugin()],
@@ -588,20 +686,49 @@ function drawPreviewUplot(out) {
   us.innerHTML = "";
   us.classList.toggle("hidden", !out.show_sum);
 
-  previewCharts.push(new uPlot(opts("Channel 1 (mA)", "#58a6ff"), [t, out.ch1], u1));
-  previewCharts.push(new uPlot(opts("Channel 2 (mA)", "#f0883e"), [t, out.ch2], u2));
+  // For fUS, only the active channel carries signal; hide the other plot
+  // entirely so the operator isn't staring at a flat line.
+  const activeCh = isFus ? out.fus_active_channel : null;
+  if (isFus && activeCh === 2) {
+    u1.classList.add("hidden");
+    u2.classList.remove("hidden");
+  } else if (isFus && activeCh === 1) {
+    u1.classList.remove("hidden");
+    u2.classList.add("hidden");
+  } else {
+    u1.classList.remove("hidden");
+    u2.classList.remove("hidden");
+  }
+
+  if (!isFus || activeCh !== 2) {
+    const title1 = isFus ? `fUS — Channel 1 (${yUnit})` : `Channel 1 (${yUnit})`;
+    previewCharts.push(new uPlot(opts(title1, "#58a6ff"), [t, out.ch1], u1));
+  }
+  if (!isFus || activeCh !== 1) {
+    const title2 = isFus ? `fUS — Channel 2 (${yUnit})` : `Channel 2 (${yUnit})`;
+    previewCharts.push(new uPlot(opts(title2, "#f0883e"), [t, out.ch2], u2));
+  }
   if (out.show_sum && out.sum_v) {
-    previewCharts.push(new uPlot(opts("TI sum Ch1+Ch2 (mA)", "#a371f7"), [t, out.sum_v], us));
+    previewCharts.push(new uPlot(opts(`TI sum Ch1+Ch2 (${yUnit})`, "#a371f7"), [t, out.sum_v], us));
   }
 }
 
 function toggleModePanels() {
-  const ti = byId("mode") && byId("mode").value === "ti";
+  const mode = byId("mode") && byId("mode").value;
   const pTi = byId("panel-ti");
   const pCtrl = byId("panel-control");
-  if (pTi) pTi.classList.toggle("hidden", !ti);
-  if (pCtrl) pCtrl.classList.toggle("hidden", ti);
-  if (ti) toggleTbsFields();
+  const pFus = byId("panel-fus");
+  if (pTi) pTi.classList.toggle("hidden", mode !== "ti");
+  if (pCtrl) pCtrl.classList.toggle("hidden", mode !== "control");
+  if (pFus) pFus.classList.toggle("hidden", mode !== "fus");
+  // In fUS mode the user-facing stim_time field is derived; lock it.
+  const stimEl = byId("stim_time_s");
+  if (stimEl) stimEl.readOnly = mode === "fus";
+  if (mode === "ti") toggleTbsFields();
+  if (mode === "fus") {
+    syncFusFromUI();
+    updateFusDerivedDisplays();
+  }
 }
 
 function toggleTbsFields() {
@@ -611,6 +738,207 @@ function toggleTbsFields() {
   const tbsLabel = byId("lbl-tbs-freq");
   if (dfLabel) dfLabel.classList.toggle("hidden", isTbs);
   if (tbsLabel) tbsLabel.classList.toggle("hidden", !isTbs);
+}
+
+// ---- fUS interlocks ------------------------------------------------------
+//
+// The fUS panel has three pairs of mutually-derived inputs:
+//   - PRF duty (0–1)         ↔ tone-burst duration (µs)   [given PRF Hz]
+//   - ISI OFF time (ms)      ↔ ISI frequency (Hz)         [given SD]
+//   - n_pulses               ↔ stimulation time (s)        [given ISI]
+//
+// The convention: when the user edits one half of a pair, we update the
+// other in the DOM (without triggering further events). A guard flag
+// prevents recursive update loops.
+
+let _fusInterlockGuard = false;
+let _fusLastEdited = {}; // map "duty" | "tone_burst" | "isi_off" | "isi_freq" | "n_pulses" | "stim_time"
+
+function _fusReadCommon() {
+  const num = (id, def) => {
+    const el = byId(id);
+    if (!el) return def;
+    const v = parseFloat(el.value);
+    return Number.isFinite(v) ? v : def;
+  };
+  return {
+    carrier_hz: num("fus_carrier_mhz", 1.0) * 1e6,
+    prf_hz: num("fus_prf_hz", 1000),
+    prf_duty: num("fus_prf_duty", 0.5),
+    tone_burst_s: num("fus_tone_burst_us", 500) * 1e-6,
+    sonication_duration_s: num("fus_sd_ms", 300) * 1e-3,
+    isi_off_s: num("fus_isi_off_ms", 200) * 1e-3,
+    isi_freq_hz: num("fus_isi_freq_hz", 2),
+    n_pulses: Math.max(1, parseInt((byId("fus_n_pulses") || {}).value || "1", 10)),
+    stim_time_s: num("fus_stim_time_s", 0.5),
+    amplitude_mv_pp: num("fus_amplitude_mv_pp", 200),
+  };
+}
+
+function _setVal(id, val) {
+  const el = byId(id);
+  if (!el) return;
+  // Round-trip through Number() to avoid trailing precision noise like
+  // "499.99999999998" when the user toggles duty/tone-burst.
+  if (Number.isFinite(val)) {
+    const rounded = Math.abs(val) < 1e-3
+      ? Number(val.toPrecision(6))
+      : Number(val.toPrecision(8));
+    el.value = String(rounded);
+  }
+}
+
+function syncFusFromUI() {
+  // Pull a consistent snapshot from the DOM, applying interlocks based on
+  // which field the user last edited. Called on every input event in the
+  // fUS panel; no-op if guard is set (we're already inside a sync).
+  if (_fusInterlockGuard) return;
+  if (byId("mode") && byId("mode").value !== "fus") return;
+  _fusInterlockGuard = true;
+  try {
+    const v = _fusReadCommon();
+
+    // Pair 1: duty ↔ tone-burst (PRF stays fixed).
+    if (_fusLastEdited.duty) {
+      const tone = v.prf_duty / v.prf_hz;
+      _setVal("fus_tone_burst_us", tone * 1e6);
+    } else if (_fusLastEdited.tone_burst) {
+      const duty = v.tone_burst_s * v.prf_hz;
+      _setVal("fus_prf_duty", duty);
+    } else {
+      // PRF or first render — re-derive tone burst from duty.
+      const tone = v.prf_duty / v.prf_hz;
+      _setVal("fus_tone_burst_us", tone * 1e6);
+    }
+
+    // Pair 2: isi_off ↔ isi_freq (SD stays fixed).
+    // ISI = SD + isi_off → isi_freq = 1 / ISI.
+    const v2 = _fusReadCommon();
+    if (_fusLastEdited.isi_freq) {
+      // user set isi_freq → derive isi_off = 1/freq - SD
+      const isi = 1 / v2.isi_freq_hz;
+      const off = isi - v2.sonication_duration_s;
+      if (off >= 0) {
+        _setVal("fus_isi_off_ms", off * 1e3);
+      } else {
+        // Reject: keep isi_off at zero and flash an error hint via the
+        // buffer indicator (so it's visible without a popup).
+        _setVal("fus_isi_off_ms", 0);
+      }
+    } else {
+      // isi_off OR SD just edited → derive isi_freq.
+      const isi = v2.sonication_duration_s + v2.isi_off_s;
+      if (isi > 0) _setVal("fus_isi_freq_hz", 1 / isi);
+    }
+
+    // Pair 3: n_pulses ↔ stim_time (ISI stays fixed).
+    const v3 = _fusReadCommon();
+    const isi3 = v3.sonication_duration_s + v3.isi_off_s;
+    if (_fusLastEdited.stim_time) {
+      const np = Math.max(1, Math.round(v3.stim_time_s / Math.max(1e-12, isi3)));
+      const npEl = byId("fus_n_pulses");
+      if (npEl) npEl.value = String(np);
+    } else {
+      // n_pulses OR ISI components changed → derive stim_time.
+      const np = v3.n_pulses;
+      _setVal("fus_stim_time_s", np * isi3);
+    }
+
+    // The hidden generic stim_time_s field is what /arm and /preview consume;
+    // keep it in sync with the fUS-derived value.
+    const v4 = _fusReadCommon();
+    _setVal("stim_time_s", v4.n_pulses * (v4.sonication_duration_s + v4.isi_off_s));
+  } finally {
+    _fusInterlockGuard = false;
+    _fusLastEdited = {};
+  }
+}
+
+function _fusBufferStatus(v) {
+  // Mirror of the server's choose_hardware_sample_rate buffer-fit math for
+  // fUS: buffer holds ONE ISI cycle, sample rate caps at 50 sps × carrier.
+  // Returns { kind: "ok"|"warn"|"err", text }.
+  const isi = v.sonication_duration_s + v.isi_off_s;
+  const fmax = v.carrier_hz;
+  if (!isi || !fmax) return { kind: "warn", text: "—" };
+  const idealSr = Math.min(HS5_MAX_SR, fmax * HS5_TARGET_SAMPLES_PER_CYCLE);
+  const minSr = fmax * HS5_MIN_SAMPLES_PER_CYCLE;
+  const maxIsiAtTarget = HS5_BUFFER_MAX / idealSr;
+  const maxIsiAtMin = HS5_BUFFER_MAX / minSr;
+  if (isi > maxIsiAtMin) {
+    return {
+      kind: "err",
+      text: `ISI cycle ${isi.toFixed(4)} s exceeds buffer (max ${maxIsiAtMin.toFixed(3)} s at carrier ${(fmax / 1e6).toFixed(2)} MHz). Reduce SD or isi_off.`,
+    };
+  }
+  if (isi > maxIsiAtTarget) {
+    const sps = HS5_BUFFER_MAX / isi / fmax;
+    return {
+      kind: "warn",
+      text: `ISI cycle ${isi.toFixed(4)} s · sample rate reduced to ${sps.toFixed(1)} samples/period at ${(fmax / 1e6).toFixed(2)} MHz to fit the buffer.`,
+    };
+  }
+  const sps = idealSr / fmax;
+  return {
+    kind: "ok",
+    text: `ISI cycle ${isi.toFixed(4)} s · ${sps.toFixed(1)} samples/period at ${(fmax / 1e6).toFixed(2)} MHz · plenty of buffer headroom.`,
+  };
+}
+
+function updateFusDerivedDisplays() {
+  const v = _fusReadCommon();
+
+  // Expected amplifier output: 50 dB gain = ×316.23 in voltage.
+  // amplitude_mv_pp → V pp at amplifier output.
+  const ampEl = byId("fus-amplifier-output");
+  if (ampEl) {
+    const vIn = v.amplitude_mv_pp / 1000.0;
+    const vOut = vIn * Math.pow(10, 50 / 20);
+    let strongClass = "";
+    let warning = "";
+    if (v.amplitude_mv_pp > 500) {
+      strongClass = " class=\"amp-err\"";
+      warning = " ⚠ Above 500 mV pp datasheet limit (VBA-230-80) — may damage the amplifier.";
+    } else if (v.amplitude_mv_pp > 400) {
+      strongClass = " class=\"amp-warn\"";
+      warning = " (approaching the 500 mV pp datasheet limit).";
+    }
+    ampEl.innerHTML =
+      `Expected amplifier output: <strong${strongClass}>${vOut.toFixed(1)} V pp</strong> at 50 dB gain` + warning;
+  }
+
+  const bufEl = byId("fus-buffer-indicator");
+  if (bufEl) {
+    const s = _fusBufferStatus(v);
+    const cls = s.kind === "ok" ? "amp-ok" : s.kind === "warn" ? "amp-warn" : "amp-err";
+    bufEl.innerHTML = `Buffer status: <strong class="${cls}">${s.text}</strong>`;
+  }
+}
+
+function wireFusInterlocks() {
+  const tagAndSync = (id, key) => {
+    const el = byId(id);
+    if (!el) return;
+    el.addEventListener("input", () => {
+      _fusLastEdited[key] = true;
+      syncFusFromUI();
+      updateFusDerivedDisplays();
+    });
+  };
+  tagAndSync("fus_prf_duty", "duty");
+  tagAndSync("fus_tone_burst_us", "tone_burst");
+  tagAndSync("fus_isi_off_ms", "isi_off");
+  tagAndSync("fus_isi_freq_hz", "isi_freq");
+  tagAndSync("fus_n_pulses", "n_pulses");
+  tagAndSync("fus_stim_time_s", "stim_time");
+  // Inputs that don't have a partner but still need to refresh derived displays:
+  ["fus_carrier_mhz", "fus_prf_hz", "fus_sd_ms", "fus_amplitude_mv_pp",
+   "fus_channel_1", "fus_channel_2"].forEach((id) => {
+    const el = byId(id);
+    if (!el) return;
+    el.addEventListener("input", () => { syncFusFromUI(); updateFusDerivedDisplays(); });
+    el.addEventListener("change", () => { syncFusFromUI(); updateFusDerivedDisplays(); });
+  });
 }
 
 function wireInputs() {
@@ -626,6 +954,7 @@ function wireInputs() {
   const refreshAllDerived = () => {
     updateTotalTimeDisplay();
     updateSampleRateDisplay();
+    updateTriggerPrologueValidation();
   };
   document
     .querySelectorAll(".form-grid input, .form-grid select")
@@ -637,8 +966,10 @@ function wireInputs() {
   if (modeEl) modeEl.addEventListener("change", toggleModePanels);
   const tiShapeEl = byId("ti_shape");
   if (tiShapeEl) tiShapeEl.addEventListener("change", toggleTbsFields);
+  wireFusInterlocks();
   toggleModePanels();
   updateSampleRateDisplay();
+  updateTriggerPrologueValidation();
 }
 
 function wireButtons() {

@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field, computed_field, field_validator, model_va
 
 
 Shape = Literal["sine", "triangle", "square", "ramp", "tbs"]
-StimMode = Literal["control", "ti"]
+StimMode = Literal["control", "ti", "fus"]
 
 
 def parse_amplitude_ratio(s: str) -> tuple[float, float]:
@@ -31,6 +31,55 @@ class ChannelParams(BaseModel):
         ge=0,
         description="Square: high-time within one period (s)",
     )
+
+
+class FusParams(BaseModel):
+    """Functional ultrasound (fUS) stimulation parameters.
+
+    Drives a 0.5–2 MHz sinusoidal carrier, internally gated by a kHz-range
+    pulse-repetition frequency (PRF) train of a chosen duty cycle. The full
+    sonication pattern is one ISI cycle (SD seconds of PRF-gated carrier
+    followed by isi_off_s of silence), played `n_pulses` times back-to-back
+    via HS5 hardware burst mode so the AWG runs continuously through the
+    entire train.
+
+    Designed for downstream amplification through e.g. a Vectawave VBA-230-80
+    (50 dB gain, 50 Ω I/O); ``amplitude_mv_pp`` is the HS5 BNC output (=
+    amplifier input). The amplifier recommends ≤500 mV pp; the UI warns
+    above that threshold but does NOT block submission.
+    """
+
+    channel: Literal[1, 2] = Field(default=1, description="Which HS5 slot drives the output (1 or 2).")
+    carrier_hz: float = Field(ge=5e5, le=2e6, default=1e6, description="Ultrasound carrier frequency (Hz); 0.5–2 MHz.")
+    prf_hz: float = Field(gt=0, default=1000, description="Pulse Repetition Frequency (Hz).")
+    prf_duty: float = Field(gt=0, lt=1, default=0.5, description="PRF duty cycle (0–1).")
+    tone_burst_s: float = Field(gt=0, default=5e-4,
+        description="Tone-burst duration = PRF on-time per cycle (s); must equal prf_duty / prf_hz.")
+    sonication_duration_s: float = Field(gt=0, default=0.3,
+        description="SD: duration of one sonication pulse, including PRF gating (s).")
+    isi_off_s: float = Field(ge=0, default=0.2,
+        description="Silent time between consecutive sonications (s). ISI = SD + isi_off_s.")
+    n_pulses: int = Field(ge=1, default=1,
+        description="Number of sonications in the ISI train (delivered via HS5 burst mode).")
+    amplitude_mv_pp: float = Field(gt=0, default=200,
+        description="HS5 BNC peak-to-peak voltage (= amplifier input). VBA-230-80 datasheet "
+                    "recommends ≤500 mV pp; UI warns above this without blocking.")
+
+    @model_validator(mode="after")
+    def fus_cross_field_consistency(self):
+        expected_tone = self.prf_duty / self.prf_hz
+        if abs(self.tone_burst_s - expected_tone) > 1e-6:
+            raise ValueError(
+                f"tone_burst_s ({self.tone_burst_s}) must equal prf_duty / prf_hz "
+                f"({expected_tone}); send one or the other and let the UI keep them in sync."
+            )
+        if self.tone_burst_s >= 1.0 / self.prf_hz:
+            raise ValueError("tone_burst_s must be shorter than one PRF period (1 / prf_hz).")
+        if self.sonication_duration_s < self.tone_burst_s:
+            raise ValueError("sonication_duration_s must be ≥ tone_burst_s.")
+        # isi_off_s = 0 is allowed (back-to-back sonications); only negative is rejected
+        # by the field validator (ge=0).
+        return self
 
 
 class StimParams(BaseModel):
@@ -68,6 +117,12 @@ class StimParams(BaseModel):
     ch2: ChannelParams | None = None
     trigger_out: bool = False
     trigger_in: bool = False
+    trigger_stimulation: bool = Field(
+        default=False,
+        description="EXT 3 gate: HIGH while the AWG is running (= during stim), LOW during "
+                    "pre/post and ISI_off gaps. For fUS, HIGH for the whole ISI train.",
+    )
+    fus: FusParams | None = None
     tbs_freq_hz: float | None = Field(
         default=None,
         ge=2,
@@ -91,6 +146,22 @@ class StimParams(BaseModel):
     def ramp_and_mode_fields(self):
         if self.ramp_s > self.stim_time_s:
             raise ValueError("ramp_s cannot exceed stim_time_s")
+        # Session prologue: when trigger_in OR trigger_out is enabled, the
+        # session begins with a 5 ms primer playback on the AWG (a DC
+        # marker pulse for trigger_out, a silent buffer for trigger_in
+        # detection). The host then reloads the stim buffer (~50–100 ms
+        # USB latency) before launching the actual stim. pre_stim_s
+        # absorbs both the marker and the reload; require enough slack.
+        if (self.trigger_in or self.trigger_out):
+            from tiestim.waveform import SESSION_PROLOGUE_MIN_PRE_STIM_S
+            if self.pre_stim_s < SESSION_PROLOGUE_MIN_PRE_STIM_S:
+                raise ValueError(
+                    f"pre_stim_s must be ≥ {SESSION_PROLOGUE_MIN_PRE_STIM_S*1000:.0f} ms when "
+                    "Trigger Out or Trigger In is enabled: the session emits a 5 ms "
+                    "marker / detection primer at the very start of pre_stim, then "
+                    "needs ~100 ms to reload the stim buffer over USB before stim. "
+                    "Either raise pre_stim_s, or disable the trigger."
+                )
         if self.ramp_s > 0 and 2 * self.ramp_s > self.stim_time_s:
             raise ValueError(
                 "ramp up and ramp down would overlap: need 2 * ramp_s <= stim_time_s "
@@ -109,6 +180,18 @@ class StimParams(BaseModel):
                 raise ValueError("TBS shape requires a non-zero delta_f_hz")
             if self.shape == "tbs" and self.tbs_freq_hz is None:
                 raise ValueError("TBS shape requires tbs_freq_hz (2–8 Hz)")
+        elif self.mode == "fus":
+            if self.fus is None:
+                raise ValueError("fUS mode requires a `fus` parameter block")
+            # stim_time_s is always derived from fUS params: it is the duration of
+            # the ISI train (n_pulses × ISI). Whatever the client sent (the UI
+            # keeps them in sync, but a stale value is harmless) is snapped here
+            # so downstream logging / CSV / preview all agree.
+            isi = self.fus.sonication_duration_s + self.fus.isi_off_s
+            object.__setattr__(self, "stim_time_s", self.fus.n_pulses * isi)
+            # Ramp must still fit within the (newly-snapped) stim_time. Re-check.
+            if self.ramp_s > self.stim_time_s:
+                raise ValueError("ramp_s cannot exceed stim_time_s")
         else:
             if self.ch1 is None or self.ch2 is None:
                 raise ValueError("control mode requires ch1 and ch2 channel parameters")

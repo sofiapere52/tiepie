@@ -14,6 +14,8 @@ from tiestim.logger import append_stim_row, row_from_params
 from tiestim.models import StimParams, StimRequest
 from tiestim.session import BaseSession
 from tiestim.waveform import (
+    SESSION_MARKER_AMP_FRAC,
+    SESSION_MARKER_S,
     _max_signal_frequency_hz,
     build_waveforms,
     choose_hardware_sample_rate,
@@ -242,6 +244,7 @@ class PreviewOut(BaseModel):
     hw_sample_rate_hz: float
     hw_sample_rate_note: str = ""
     preview_sample_rate_hz: float
+    fus_active_channel: int | None = None
 
 
 # Max source samples allocated for **one cycle** of preview (overview or
@@ -353,7 +356,78 @@ def _build_preview_response(
         hw_sample_rate_hz=hw_sr,
         hw_sample_rate_note=hw_note,
         preview_sample_rate_hz=preview_sr,
+        fus_active_channel=p.fus.channel if p.mode == "fus" and p.fus is not None else None,
     )
+
+
+def _stim_only_samples(
+    p_hw: StimParams, preview_sr: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build the AWG's stim-phase samples for one repetition at preview_sr.
+
+    Control / TI / TBS → the ``stim_time_s`` window.
+    fUS → the full ``n_pulses × ISI`` train (one ISI cycle tiled
+    ``n_pulses`` times in display space).
+
+    No pre/post padding here — that is added by ``_one_rep_envelope`` so
+    the preview honours the silent gaps before and after the AWG runs.
+    """
+    p_prev = p_hw.model_copy(update={"sample_rate_hz": preview_sr})
+    wf = build_waveforms(p_prev)
+    a1, a2 = peak_amplitudes(p_prev)
+    v1, v2 = waveform_to_amps(wf, a1, a2)
+    if p_hw.mode == "fus" and p_hw.fus is not None and p_hw.fus.n_pulses > 1:
+        v1 = np.tile(v1, p_hw.fus.n_pulses)
+        v2 = np.tile(v2, p_hw.fus.n_pulses)
+    return v1, v2
+
+
+def _one_rep_envelope(
+    p_hw: StimParams,
+    preview_sr: float,
+    *,
+    with_marker: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build one full repetition envelope at preview_sr.
+
+    Layout: ``[pre_stim zeros]  |  [stim samples]  |  [post_stim zeros]``.
+    The total length is ``total_time_s × preview_sr`` so the preview
+    accurately depicts the AWG-off windows around the stim — that is what
+    fixes the "no silence between reps" artefact.
+
+    When ``with_marker`` is True **and** ``trigger_out`` is on, the very
+    first ``SESSION_MARKER_S`` of the pre_stim zeros is overwritten with
+    a constant DC value of ``SESSION_MARKER_AMP_FRAC × peak`` on each
+    active channel — that is exactly what the AWG plays during the
+    session prologue. When only ``trigger_in`` is on, the prologue is a
+    silent primer; the envelope is identical to the non-marker case
+    (no visible change in the plot).
+    """
+    v1_stim, v2_stim = _stim_only_samples(p_hw, preview_sr)
+    n_stim = len(v1_stim)
+    n_pre = int(round(p_hw.pre_stim_s * preview_sr))
+    n_post = int(round(p_hw.post_stim_s * preview_sr))
+    n_total = n_pre + n_stim + n_post
+    v1 = np.zeros(n_total, dtype=np.float64)
+    v2 = np.zeros(n_total, dtype=np.float64)
+    if n_stim > 0:
+        v1[n_pre : n_pre + n_stim] = v1_stim
+        v2[n_pre : n_pre + n_stim] = v2_stim
+
+    if with_marker and p_hw.trigger_out:
+        n_marker = max(1, int(round(SESSION_MARKER_S * preview_sr)))
+        # Never overwrite the stim block, even if pre_stim is suspiciously
+        # short (the validator guarantees pre_stim_s ≥ 105 ms here, but
+        # we keep this defensive).
+        n_marker = min(n_marker, n_pre)
+        a1, a2 = peak_amplitudes(p_hw)
+        # For fUS the inactive channel's peak is 0 → marker is invisible
+        # on that trace (matches the actual gen.set_data on the AWG).
+        v1[:n_marker] = SESSION_MARKER_AMP_FRAC * a1
+        v2[:n_marker] = SESSION_MARKER_AMP_FRAC * a2
+
+    t = np.arange(n_total, dtype=np.float64) / preview_sr
+    return t, v1, v2
 
 
 @router.post("/waveform/preview", response_model=PreviewOut)
@@ -374,38 +448,41 @@ async def waveform_preview(body: StimRequest):
     cycle_dur = float(p.total_time_s)
     total_dur = cycle_dur * max(1, n_cycles_requested)
     show_sum = p.mode == "ti"
+    needs_prologue = bool(p_hw.trigger_in or p_hw.trigger_out)
+    preview_sr = _preview_source_sr(
+        p_hw,
+        source_budget=_PREVIEW_SOURCE_BUDGET_SAMPLES_PER_CYCLE,
+        hw_sr_cap=hw_sr,
+    )
 
     # ---- Windowed (zoom) mode ------------------------------------------------
     # Triggered when both endpoints of a meaningful sub-range are provided.
-    # We build ONE cycle at a higher source sample rate (memory: bounded by
-    # `_PREVIEW_SOURCE_ZOOM_MAX_SAMPLES`) and slice the touched cycles to
-    # exactly the requested window. Because the window is small, the carrier
-    # appears smooth even at deep zoom — that is the whole point of this
-    # branch.
+    # We build two per-rep envelopes (one with marker, one without) at the
+    # preview source rate and slice each touched cycle from the appropriate
+    # one. The pre/post zeros are part of the envelope, so the silent gaps
+    # appear naturally in the zoom — no more zigzag between consecutive reps.
     if (
         body.t_start_s is not None
         and body.t_end_s is not None
         and body.t_end_s > body.t_start_s
         and cycle_dur > 0
+        and p.mode != "fus"
     ):
         t0 = max(0.0, float(body.t_start_s))
         t1 = min(total_dur, float(body.t_end_s))
-        # Only treat as a "real" zoom when the window is a meaningful slice.
-        # Within ~0.1 % of the full extent, fall through to overview to avoid
-        # spurious zoom-mode renders on the initial draw.
         if t1 > t0 and (t1 - t0) < total_dur * 0.999:
-            preview_sr = _preview_source_sr(
-                p_hw,
-                source_budget=_PREVIEW_SOURCE_BUDGET_SAMPLES_PER_CYCLE,
-                hw_sr_cap=hw_sr,
+            t_normal, v1_normal, v2_normal = _one_rep_envelope(
+                p_hw, preview_sr, with_marker=False
             )
-            preview_params = p_hw.model_copy(update={"sample_rate_hz": preview_sr})
-            wf = build_waveforms(preview_params)
-            a1, a2 = peak_amplitudes(preview_params)
-            v1_one, v2_one = waveform_to_amps(wf, a1, a2)
-            n_per_cycle = len(v1_one)
-            t_one = np.arange(n_per_cycle, dtype=np.float64) / preview_sr
-            sum_one = (v1_one + v2_one).astype(np.float64) if show_sum else None
+            if needs_prologue:
+                _, v1_marker, v2_marker = _one_rep_envelope(
+                    p_hw, preview_sr, with_marker=True
+                )
+            else:
+                v1_marker, v2_marker = v1_normal, v2_normal
+            n_per_cycle = len(t_normal)
+            sum_normal = (v1_normal + v2_normal) if show_sum else None
+            sum_marker = (v1_marker + v2_marker) if show_sum else None
 
             kmin = max(0, int(t0 // cycle_dur))
             kmax = min(n_cycles_requested - 1, int(t1 // cycle_dur))
@@ -417,15 +494,16 @@ async def waveform_preview(body: StimRequest):
                 i1 = min(n_per_cycle, int(np.ceil(cend * preview_sr)))
                 if i1 <= i0:
                     continue
-                v1_parts.append(v1_one[i0:i1])
-                v2_parts.append(v2_one[i0:i1])
-                if sum_one is not None:
-                    sum_parts.append(sum_one[i0:i1])
-                t_parts.append(t_one[i0:i1] + k * cycle_dur)
+                pick1 = v1_marker if k == 0 else v1_normal
+                pick2 = v2_marker if k == 0 else v2_normal
+                picksum = sum_marker if k == 0 else sum_normal
+                v1_parts.append(pick1[i0:i1])
+                v2_parts.append(pick2[i0:i1])
+                if picksum is not None:
+                    sum_parts.append(picksum[i0:i1])
+                t_parts.append(t_normal[i0:i1] + k * cycle_dur)
 
             if not t_parts:
-                # Window fell entirely outside any built sample (defensive;
-                # the kmin/kmax computation makes this essentially unreachable).
                 big_t = np.array([t0, t1], dtype=np.float64)
                 big_v1 = np.zeros(2)
                 big_v2 = np.zeros(2)
@@ -458,39 +536,53 @@ async def waveform_preview(body: StimRequest):
                 sum_arr=big_sum,
             )
 
-    # ---- Overview mode -------------------------------------------------------
-    # Build ONE cycle, decimate it to `pts_per_cycle = max_pts // n_cycles`
-    # display points, and tile that decimated cycle in display space. This
-    # keeps source memory bounded by a single cycle no matter how many
-    # repetitions the user asked for, so all reps are always shown.
-    preview_sr = _preview_source_sr(
-        p_hw,
-        source_budget=_PREVIEW_SOURCE_BUDGET_SAMPLES_PER_CYCLE,
-        hw_sr_cap=hw_sr,
+    # ---- Overview mode (all modes, including fUS) ---------------------------
+    # Build a "normal" repetition envelope (pre_stim zeros + stim + post_stim
+    # zeros), decimate it once to ``pts_per_cycle = max_pts // n_cycles``, and
+    # tile that decimated envelope across reps 1..N-1. Rep 0 is decimated
+    # separately when a session prologue is scheduled, so the marker pulse
+    # shows up on the first rep only.
+    t_normal, v1_normal, v2_normal = _one_rep_envelope(
+        p_hw, preview_sr, with_marker=False
     )
-    preview_params = p_hw.model_copy(update={"sample_rate_hz": preview_sr})
-    wf = build_waveforms(preview_params)
-    a1, a2 = peak_amplitudes(preview_params)
-    v1_one, v2_one = waveform_to_amps(wf, a1, a2)
-    n_per_cycle = len(v1_one)
-    t_one = np.arange(n_per_cycle, dtype=np.float64) / preview_sr
-    sum_one = (v1_one + v2_one).astype(np.float64) if show_sum else None
+    sum_normal = (v1_normal + v2_normal) if show_sum else None
 
     n_cycles = max(1, n_cycles_requested)
     pts_per_cycle = max(2, body.preview_max_points // n_cycles)
 
-    to_dec = [v1_one, v2_one]
-    if sum_one is not None:
-        to_dec.append(sum_one)
-    dec_arrs, dec_t = _decimate_minmax(to_dec, t_one, pts_per_cycle)
+    to_dec_normal = [v1_normal, v2_normal]
+    if sum_normal is not None:
+        to_dec_normal.append(sum_normal)
+    dec_normal, dec_t = _decimate_minmax(to_dec_normal, t_normal, pts_per_cycle)
     n_pts = len(dec_t)
+
+    if needs_prologue:
+        _, v1_marker, v2_marker = _one_rep_envelope(
+            p_hw, preview_sr, with_marker=True
+        )
+        sum_marker = (v1_marker + v2_marker) if show_sum else None
+        to_dec_marker = [v1_marker, v2_marker]
+        if sum_marker is not None:
+            to_dec_marker.append(sum_marker)
+        dec_marker, _ = _decimate_minmax(to_dec_marker, t_normal, pts_per_cycle)
+    else:
+        dec_marker = dec_normal
 
     big_t = np.empty(n_pts * n_cycles, dtype=np.float64)
     for i in range(n_cycles):
         big_t[i * n_pts : (i + 1) * n_pts] = dec_t + i * cycle_dur
-    big_v1 = np.tile(dec_arrs[0], n_cycles)
-    big_v2 = np.tile(dec_arrs[1], n_cycles)
-    big_sum = np.tile(dec_arrs[2], n_cycles) if sum_one is not None else None
+    big_v1 = np.concatenate(
+        [dec_marker[0]] + [dec_normal[0]] * (n_cycles - 1)
+    )
+    big_v2 = np.concatenate(
+        [dec_marker[1]] + [dec_normal[1]] * (n_cycles - 1)
+    )
+    if sum_normal is not None:
+        big_sum = np.concatenate(
+            [dec_marker[2]] + [dec_normal[2]] * (n_cycles - 1)
+        )
+    else:
+        big_sum = None
 
     return _build_preview_response(
         p,
@@ -511,18 +603,45 @@ async def waveform_preview(body: StimRequest):
 async def plan(params: StimParams):
     """Return the hardware sample rate that would be used for these params,
     plus an optional human-readable note. Used by the GUI to show the chosen
-    rate next to the total-time display, without building a waveform."""
+    rate next to the total-time display, without building a waveform.
+
+    Reports buffer math relative to what the AWG will actually hold: the
+    stim block (Control/TI/TBS) or one ISI cycle (fUS).
+    """
+    from tiestim.waveform import _buffer_duration_s
+
     try:
         sr, note = choose_hardware_sample_rate(params)
-        return {
-            "ok": True,
-            "sample_rate_hz": sr,
-            "sample_rate_note": note,
-            "total_time_s": params.total_time_s,
-            "buffer_samples": int(round(params.total_time_s * sr)),
-        }
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
+
+    buf_dur = _buffer_duration_s(params)
+    resp = {
+        "ok": True,
+        "sample_rate_hz": sr,
+        "sample_rate_note": note,
+        "total_time_s": params.total_time_s,
+        "stim_time_s": params.stim_time_s,
+        "buffer_duration_s": buf_dur,
+        "buffer_samples": int(round(buf_dur * sr)),
+    }
+    if params.mode == "fus" and params.fus is not None:
+        isi = params.fus.sonication_duration_s + params.fus.isi_off_s
+        resp["fus"] = {
+            "channel": params.fus.channel,
+            "carrier_hz": params.fus.carrier_hz,
+            "prf_hz": params.fus.prf_hz,
+            "prf_duty": params.fus.prf_duty,
+            "tone_burst_s": params.fus.tone_burst_s,
+            "sonication_duration_s": params.fus.sonication_duration_s,
+            "isi_off_s": params.fus.isi_off_s,
+            "isi_s": isi,
+            "n_pulses": params.fus.n_pulses,
+            "train_duration_s": params.fus.n_pulses * isi,
+            "amplitude_mv_pp": params.fus.amplitude_mv_pp,
+            "expected_amplifier_output_v_pp": params.fus.amplitude_mv_pp * 316 / 1000.0,
+        }
+    return resp
 
 
 @router.post("/arm")
